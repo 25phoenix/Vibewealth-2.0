@@ -51,6 +51,45 @@
   --avatar-foreground: #765b39;
 }
 
+.dark {
+  color-scheme: dark;
+  --background: #141c17;
+  --foreground: #e3eae3;
+  --card: #1c2720;
+  --card-foreground: #e3eae3;
+  --popover: #1c2720;
+  --popover-foreground: #e3eae3;
+  --primary: #82c4a0;
+  --primary-foreground: #14251b;
+  --secondary: #26382c;
+  --secondary-foreground: #c9dfce;
+  --muted: #253129;
+  --muted-foreground: #a1afa5;
+  --accent: #2d4133;
+  --accent-foreground: #d4e6d7;
+  --destructive: #e08a78;
+  --border: #344138;
+  --input: #3a493e;
+  --ring: #7bb595;
+  --sidebar: #18231c;
+  --sidebar-foreground: #e3eae3;
+  --sidebar-primary: #82c4a0;
+  --sidebar-primary-foreground: #14251b;
+  --sidebar-accent: #26382c;
+  --sidebar-accent-foreground: #d4e6d7;
+  --sidebar-border: #303d34;
+  --sidebar-ring: #7bb595;
+  --positive: #83c997;
+  --negative: #e09b84;
+  --chart-1: #82c4a0;
+  --chart-2: #4f8f70;
+  --chart-3: #d7b56a;
+  --chart-4: #90a8bc;
+  --chart-5: #59675c;
+  --avatar: #423b2e;
+  --avatar-foreground: #f0dcae;
+}
+
 @theme inline {
   --font-sans: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
   --font-heading: 'Geist Variable', ui-sans-serif, system-ui, sans-serif;

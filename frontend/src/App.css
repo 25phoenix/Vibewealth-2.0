@@ -99,3 +99,65 @@
   .chart-wrap { width: min(100%, 190px); margin-inline: auto; }
   .category-list { padding: 0 8px 8px; }
 }
+
+.transaction-table { min-width: 0; }
+.transaction-table-head, .transaction-table-row { display: grid; grid-template-columns: minmax(170px, 2fr) minmax(100px, 1fr) minmax(100px, 1fr) 78px minmax(110px, .9fr) 72px; align-items: center; gap: 10px; }
+.transaction-table-head { padding: 10px 12px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); color: var(--muted-foreground); font-size: 10px; font-weight: 600; }
+.transaction-list-page { margin: 0; padding: 0 12px; list-style: none; }
+.transaction-table-row { min-height: 57px; border-bottom: 1px solid var(--border); }
+.transaction-table-row:last-child { border-bottom: 0; }
+.transaction-description { display: grid; min-width: 0; gap: 3px; }
+.transaction-description strong { overflow: hidden; color: var(--foreground); font-size: 12px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+.transaction-description small { overflow: hidden; color: var(--muted-foreground); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.table-category, .table-date { overflow: hidden; color: var(--muted-foreground); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.type-label { width: fit-content; border-radius: 999px; padding: 3px 7px; font-size: 10px; font-weight: 500; }
+.type-label.income { background: color-mix(in srgb, var(--positive) 10%, white); color: var(--positive); }
+.type-label.expense { background: var(--muted); color: var(--muted-foreground); }
+.table-amount { color: var(--foreground); font-size: 12px; font-weight: 600; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.table-amount.income { color: var(--positive); }
+.row-actions { display: flex; justify-content: end; gap: 2px; }
+.row-actions svg { width: 14px; height: 14px; }
+.budget-status { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; white-space: nowrap; }
+.budget-status.healthy { background: color-mix(in srgb, var(--positive) 10%, white); color: var(--positive); }
+.budget-status.approaching { background: color-mix(in srgb, var(--chart-3) 20%, white); color: color-mix(in srgb, var(--chart-3) 65%, var(--foreground)); }
+.budget-status.exceeded { background: color-mix(in srgb, var(--negative) 10%, white); color: var(--negative); }
+.budget-progress, .goal-progress { gap: 0; }
+.budget-progress.approaching [data-slot="progress-indicator"] { background: var(--chart-3); }
+.budget-progress.exceeded [data-slot="progress-indicator"] { background: var(--negative); }
+.assistant-card { min-height: min(680px, calc(100vh - 205px)); }
+.assistant-content { display: flex; min-height: 430px; flex: 1; flex-direction: column; padding: 0; }
+.assistant-empty { display: grid; flex: 1; align-content: center; justify-items: center; gap: 18px; padding: 36px 20px; }
+.chat-log { display: grid; flex: 1; align-content: start; gap: 18px; overflow-y: auto; padding: 24px clamp(16px, 5vw, 52px); }
+.chat-user { display: flex; justify-content: end; }
+.chat-assistant { display: flex; align-items: start; gap: 9px; }
+.chat-avatar { display: grid; width: 29px; height: 29px; flex: 0 0 auto; place-items: center; border-radius: 9px; background: var(--secondary); color: var(--primary); }
+.chat-bubble { display: grid; max-width: min(100%, 630px); gap: 8px; border: 1px solid var(--border); border-radius: 13px; padding: 12px 14px; background: var(--muted); }
+.chat-bubble p { margin: 0; color: var(--foreground); font-size: 13px; line-height: 1.6; white-space: pre-wrap; }
+.chat-bubble time { color: var(--muted-foreground); font-size: 10px; }
+.chat-user-bubble { border-color: var(--primary); border-bottom-right-radius: 4px; background: var(--primary); }
+.chat-user-bubble p, .chat-user-bubble time { color: var(--primary-foreground); }
+.chat-mock-label { color: var(--primary); font-size: 9px; font-weight: 700; letter-spacing: .08em; }
+.chat-composer { display: grid; gap: 8px; border-top: 1px solid var(--border); padding: 14px 18px; }
+.chat-composer textarea { min-height: 64px; resize: vertical; }
+.chat-composer button svg { width: 15px; height: 15px; }
+.merchant-income { background: color-mix(in srgb, var(--positive) 18%, white); color: var(--positive); }
+.merchant-expense { background: var(--secondary); color: var(--primary); }
+
+@media (max-width: 900px) {
+  .transaction-table-head { display: none; }
+  .transaction-table-row { grid-template-columns: minmax(0, 1fr) auto 68px; grid-template-areas: "description amount actions" "date category type"; row-gap: 4px; padding: 10px 0; }
+  .transaction-description { grid-area: description; }
+  .table-date { grid-area: date; }
+  .table-category { grid-area: category; }
+  .type-label { grid-area: type; }
+  .table-amount { grid-area: amount; }
+  .row-actions { grid-area: actions; }
+}
+@media (max-width: 620px) {
+  .transaction-table-row { grid-template-columns: minmax(0, 1fr) auto 64px; }
+  .assistant-card { min-height: calc(100dvh - 170px); }
+  .assistant-content { min-height: 0; }
+  .assistant-empty { gap: 14px; padding: 25px 15px; }
+  .chat-log { max-height: calc(100dvh - 370px); padding: 17px 14px; }
+  .chat-composer { padding: 12px; }
+}

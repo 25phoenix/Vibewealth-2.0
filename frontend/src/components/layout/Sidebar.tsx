@@ -14,6 +14,7 @@ import {
   SidebarMenuItem,
   SidebarSeparator,
 } from '@/components/ui/sidebar'
+import { useFinance } from '@/hooks/useFinance'
 import { navigationItems, settingsItem, type NavigationItem } from './navigation'
 
 interface SidebarProps {
@@ -22,6 +23,10 @@ interface SidebarProps {
 }
 
 export function AppSidebar({ activePage, onNavigate }: SidebarProps) {
+  const { snapshot } = useFinance()
+  const profileName = snapshot.profile.name
+  const initials = profileName.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase()
+
   const renderItem = (item: NavigationItem) => {
     const Icon = item.icon
 
@@ -58,9 +63,9 @@ export function AppSidebar({ activePage, onNavigate }: SidebarProps) {
         </div>
 
         <div className="flex items-center gap-2.5 rounded-xl border border-sidebar-border bg-background/70 p-2.5 group-data-[collapsible=icon]:hidden">
-          <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary text-xs font-semibold text-secondary-foreground">A</div>
+          <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary text-xs font-semibold text-secondary-foreground">{initials.slice(0, 1)}</div>
           <div className="grid min-w-0 gap-0.5">
-            <span className="truncate text-xs font-medium text-foreground">Alex Morgan</span>
+            <span className="truncate text-xs font-medium text-foreground">{profileName}</span>
             <span className="truncate text-[10px] text-muted-foreground">Personal workspace</span>
           </div>
           <Badge variant="outline" className="ml-auto border-transparent bg-secondary px-1.5 text-[9px] text-secondary-foreground">Demo</Badge>
@@ -91,9 +96,9 @@ export function AppSidebar({ activePage, onNavigate }: SidebarProps) {
 
       <SidebarFooter className="p-3">
         <div className="flex items-center gap-2.5 rounded-xl border border-sidebar-border p-2 group-data-[collapsible=icon]:justify-center group-data-[collapsible=icon]:border-transparent">
-          <div className="grid size-8 shrink-0 place-items-center rounded-full bg-[var(--avatar)] text-[10px] font-semibold text-[var(--avatar-foreground)]">AM</div>
+          <div className="grid size-8 shrink-0 place-items-center rounded-full bg-[var(--avatar)] text-[10px] font-semibold text-[var(--avatar-foreground)]">{initials}</div>
           <div className="grid min-w-0 gap-0.5 group-data-[collapsible=icon]:hidden">
-            <span className="truncate text-xs font-medium text-foreground">Alex Morgan</span>
+            <span className="truncate text-xs font-medium text-foreground">{profileName}</span>
             <span className="truncate text-[10px] text-muted-foreground">Personal plan</span>
           </div>
         </div>
