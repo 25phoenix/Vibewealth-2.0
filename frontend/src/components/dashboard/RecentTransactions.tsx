@@ -36,7 +36,7 @@ export function RecentTransactions({ transactions, currency, onViewAll }: Recent
                   <span>{formatDate(transaction.date)}</span>
                 </span>
                 <Badge variant="outline" className="transaction-category">{transaction.category}</Badge>
-                <strong className={`transaction-amount ${isIncome ? 'income-amount' : ''}`}>
+                <strong className={`transaction-amount ${isIncome ? 'income-amount' : 'expense-amount'}`}>
                   <DirectionIcon aria-hidden="true" size={14} />
                   {isIncome ? '+' : '−'}{formatCurrency(transaction.amountPaise, currency)}
                 </strong>

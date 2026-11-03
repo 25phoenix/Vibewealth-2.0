@@ -58,6 +58,7 @@
 .transaction-amount { display: flex; align-items: center; justify-content: end; gap: 4px; color: var(--foreground); font-size: 11px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .transaction-amount svg { color: var(--muted-foreground); }
 .income-amount, .income-amount svg { color: var(--positive); }
+.expense-amount, .table-amount.expense { color: var(--negative); }
 .placeholder-page { display: flex; min-height: calc(100vh - 64px); flex-direction: column; }
 .placeholder-page .back-button { align-self: flex-start; gap: 6px; color: var(--muted-foreground); }
 .placeholder-card { width: min(100%, 420px); margin: auto; text-align: center; }
