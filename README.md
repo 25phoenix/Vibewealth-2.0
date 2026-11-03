@@ -48,6 +48,18 @@ The project is currently in its frontend development phase.
 
 The initial frontend will use mock financial data and simulated interactions. Backend integration and AI functionality will be implemented in subsequent phases.
 
+## Run the frontend
+
+The frontend lives in `frontend/` and uses npm. With Node.js 20.19+ or 22.12+ installed:
+
+```sh
+cd frontend
+npm install
+npm run dev
+```
+
+See `frontend/README.md` for TypeScript, lint, and production build checks.
+
 ## Project Structure
 
 - `frontend/` – React application
