@@ -1,0 +1,1 @@
+"""VibeWealth backend application package."""
