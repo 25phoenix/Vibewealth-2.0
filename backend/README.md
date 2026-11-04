@@ -52,10 +52,11 @@ environment variables; a local `.env` file is optional for the API.
 | `POSTGRES_DB` | `vibewealth` | Local PostgreSQL database name |
 | `POSTGRES_USER` | `vibewealth_app` | Local PostgreSQL user |
 | `POSTGRES_PASSWORD` | *(set locally)* | Local PostgreSQL password |
+| `POSTGRES_HOST` | `localhost` | PostgreSQL host used by the backend |
 | `POSTGRES_PORT` | `5432` | Host loopback port mapped to PostgreSQL |
 | `APP_TITLE` | `VibeWealth API` | FastAPI application title |
 | `APP_VERSION` | `0.1.0` | API version |
-| `DATABASE_URL` | `postgresql+psycopg://localhost:5432/vibewealth` | Reserved for future API database integration; no connection is made yet |
+| `DATABASE_URL` | *(optional)* | Full `postgresql+psycopg` override; leave blank to construct the URL from `POSTGRES_*` settings |
 | `CORS_ORIGINS` | `["http://localhost:5173"]` | JSON list of allowed browser origins |
 
 `.env` and other local secret files are excluded from Git. Do not commit local
@@ -118,3 +119,5 @@ docker compose down -v
 
 The reset command permanently deletes local PostgreSQL data. The named volume
 is `vibewealth_postgres_data`.
+
+
