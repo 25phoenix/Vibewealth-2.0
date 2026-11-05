@@ -30,7 +30,17 @@ def test_alembic_configuration_loads_without_embedded_database_url() -> None:
 
 def test_alembic_uses_application_metadata_and_settings() -> None:
     assert target_metadata is Base.metadata
-    assert target_metadata.sorted_tables == []
+    assert {table.name for table in target_metadata.sorted_tables} == {
+        "accounts",
+        "assistant_conversations",
+        "assistant_messages",
+        "budgets",
+        "categories",
+        "goal_entries",
+        "savings_goals",
+        "transactions",
+        "users",
+    }
     assert get_migration_url() == get_settings().sqlalchemy_url
     assert engine.url == get_migration_url()
     assert get_migration_url().drivername == "postgresql+psycopg"
