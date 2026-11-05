@@ -1,1 +1,5 @@
-"""SQLAlchemy models will be added here as persistence is introduced."""
+"""SQLAlchemy model metadata."""
+
+from app.models.base import Base
+
+__all__ = ["Base"]

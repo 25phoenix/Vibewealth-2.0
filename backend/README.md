@@ -1,39 +1,27 @@
 # VibeWealth Backend
 
-The backend is a modular FastAPI foundation for VibeWealth 2.0. It currently
-provides application configuration, configurable CORS, and a health endpoint.
-The local PostgreSQL service is available through Docker Compose. The API does
-not connect to the database yet; authentication and financial features are
-planned but not implemented.
+The backend is a modular FastAPI application with SQLAlchemy 2.x connectivity to
+local PostgreSQL. It currently provides health endpoints and request-scoped
+sessions. No finance models, authentication, or financial APIs have been added.
+Schema changes are managed explicitly with Alembic migrations.
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.12
 - pip
-- Docker Engine and Docker Compose (the project's configured setup uses WSL2 Ubuntu)
+- Docker Engine and Docker Compose (the project's configured database setup uses WSL2 Ubuntu)
 
 ## Set up a Python environment
 
-From the repository root:
+From the repository root in WSL2 Ubuntu:
 
 ```sh
-cd backend
-python -m venv .venv
-```
-
-Activate the environment:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
-
-On macOS or Linux:
-
-```sh
+cd /mnt/c/Acads/Projects/goaldigger/backend
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-## Install dependencies
+Do not use a Windows `.venv` from WSL. Install dependencies:
 
 ```sh
 python -m pip install --upgrade pip
@@ -42,10 +30,11 @@ python -m pip install -r requirements.txt
 
 ## Configure environment variables
 
-Copy `.env.example` to `.env` and replace `POSTGRES_PASSWORD` with a private,
-locally chosen value before starting the database. The example password is a
-placeholder and must not be used as a credential. Settings are read from
-environment variables; a local `.env` file is optional for the API.
+Create `.env` from `.env.example` once and set a private `POSTGRES_PASSWORD`.
+The example password is a placeholder and must not be used as a credential.
+`DATABASE_URL` is optional; when blank, the backend builds a PostgreSQL URL
+from the `POSTGRES_*` settings. A supplied URL must use the
+`postgresql+psycopg` driver.
 
 | Variable | Default | Description |
 | --- | --- | --- |
@@ -54,24 +43,25 @@ environment variables; a local `.env` file is optional for the API.
 | `POSTGRES_PASSWORD` | *(set locally)* | Local PostgreSQL password |
 | `POSTGRES_HOST` | `localhost` | PostgreSQL host used by the backend |
 | `POSTGRES_PORT` | `5432` | Host loopback port mapped to PostgreSQL |
+| `DATABASE_URL` | *(optional)* | Full `postgresql+psycopg` override; leave blank to construct the URL from `POSTGRES_*` settings |
 | `APP_TITLE` | `VibeWealth API` | FastAPI application title |
 | `APP_VERSION` | `0.1.0` | API version |
-| `DATABASE_URL` | *(optional)* | Full `postgresql+psycopg` override; leave blank to construct the URL from `POSTGRES_*` settings |
 | `CORS_ORIGINS` | `["http://localhost:5173"]` | JSON list of allowed browser origins |
 
 `.env` and other local secret files are excluded from Git. Do not commit local
 credentials.
 
-## Run the development server
+## Run the API
 
-From `backend/` with the virtual environment active:
+From `backend/` with the environment active:
 
 ```sh
 uvicorn app.main:app --reload
 ```
 
-The API is available at `http://127.0.0.1:8000`; its health endpoint is
-`http://127.0.0.1:8000/health`.
+The API is available at `http://127.0.0.1:8000`. `GET /health` checks the API
+process; `GET /health/db` runs `SELECT 1` and returns 503 if PostgreSQL is not
+reachable.
 
 ## Run tests
 
@@ -79,12 +69,18 @@ The API is available at `http://127.0.0.1:8000`; its health endpoint is
 python -m pytest
 ```
 
+The standard suite uses mocks and an isolated in-memory SQLite connection. The
+opt-in PostgreSQL integration test uses the configured `DATABASE_URL` or
+`POSTGRES_*` values and does not create or change schema objects:
+
+```sh
+RUN_POSTGRES_INTEGRATION=1 python -m pytest tests/test_database.py -k postgresql_connection
+```
+
 ## Manage the local PostgreSQL database
 
-Run these commands in WSL2 Ubuntu from the repository's `backend/` directory.
-Create `.env` from `.env.example` once, then set a private `POSTGRES_PASSWORD`
-before starting the service. The database port is bound only to `127.0.0.1` on
-the host; set `POSTGRES_PORT` in `.env` to change it.
+Run these commands in WSL2 Ubuntu from `backend/`. PostgreSQL is bound to
+`127.0.0.1`; set `POSTGRES_PORT` in `.env` to change the host port.
 
 Start PostgreSQL in the background:
 
@@ -120,4 +116,45 @@ docker compose down -v
 The reset command permanently deletes local PostgreSQL data. The named volume
 is `vibewealth_postgres_data`.
 
+## Manage database migrations
 
+Run Alembic commands from `backend/` in WSL2 with the Linux virtual environment
+active and `.env` configured. The migration environment reuses the same
+validated connection URL and `Base.metadata` as the FastAPI application. The
+Alembic configuration file contains no database credentials. Migrations run
+only when explicitly invoked; application startup does not alter the schema.
+
+Create a migration after adding or changing ORM models:
+
+```sh
+alembic revision --autogenerate -m "description"
+```
+
+Review every generated migration before applying it. Existing database tables
+without corresponding ORM metadata are excluded from autogenerated drop
+operations. The current project has no finance models or migration revisions.
+
+Apply migrations:
+
+```sh
+alembic upgrade head
+```
+
+Roll back one migration:
+
+```sh
+alembic downgrade -1
+```
+
+Check the current revision and migration history:
+
+```sh
+alembic current
+alembic history
+```
+
+Check whether model metadata differs from the current database schema:
+
+```sh
+alembic check
+```
