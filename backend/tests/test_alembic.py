@@ -32,6 +32,7 @@ def test_alembic_uses_application_metadata_and_settings() -> None:
     assert target_metadata is Base.metadata
     assert {table.name for table in target_metadata.sorted_tables} == {
         "accounts",
+        "auth_sessions",
         "assistant_conversations",
         "assistant_messages",
         "budgets",
@@ -52,11 +53,17 @@ def test_autogeneration_ignores_unmodeled_reflected_tables() -> None:
     assert include_object(object(), "new_table", "table", False, None) is True
 
 
-def test_migration_revision_inspection_starts_empty() -> None:
+def test_auth_session_migration_follows_initial_revision() -> None:
     script_directory = ScriptDirectory.from_config(load_alembic_config())
 
-    assert script_directory.get_heads() == []
-    assert list(script_directory.walk_revisions()) == []
+    revisions = list(script_directory.walk_revisions())
+    assert len(revisions) == 2
+    assert script_directory.get_heads() == [revisions[0].revision]
+    assert revisions[0].down_revision == "4da570f34c63"
+    assert revisions[0].doc == "add authentication sessions"
+    assert revisions[1].revision == "4da570f34c63"
+    assert revisions[1].down_revision is None
+    assert revisions[1].doc == "initial schema"
 
 
 def test_upgrade_and_downgrade_use_isolated_sqlite_database(tmp_path: Path) -> None:

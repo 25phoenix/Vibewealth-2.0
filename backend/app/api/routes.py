@@ -6,9 +6,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.api.auth_routes import router as auth_router
 from app.core.database import get_db
 
 router = APIRouter()
+router.include_router(auth_router)
 
 
 @router.get("/health", tags=["health"])

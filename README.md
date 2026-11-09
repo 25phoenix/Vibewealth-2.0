@@ -1,78 +1,68 @@
+# VibeWealth 2.0
 
-# GoalDigger/VibeWealth 2.0
+VibeWealth is a personal finance application in development. The repository
+currently contains a polished frontend prototype and a separate FastAPI backend
+foundation. The frontend still uses sample finance data and is not connected to
+the backend.
 
-An AI-powered personal finance management platform designed to help young adults understand, manage, and improve their financial habits.
+## Current implementation
 
-## Vision
+- **Frontend:** React, TypeScript, Vite, Tailwind CSS, shadcn/ui, and Recharts.
+  It has dashboard, transactions, budgets, savings goals, assistant, and
+  settings pages. Finance records and assistant replies are mock data held in
+  browser memory; preferences are stored locally. The UI uses INR and integer
+  paise.
+- **Backend:** FastAPI, SQLAlchemy 2.x, PostgreSQL, and Alembic. It has database
+  models and migrations for users, accounts, categories, transactions, budgets,
+  savings goals and entries, assistant conversations and messages, and
+  authentication sessions. Cookie-based registration, login, current-user,
+  CSRF-token, and logout endpoints are implemented, along with health endpoints.
+- **Not implemented yet:** frontend-to-backend integration, financial CRUD/API
+  operations, account recovery, a persistent assistant service, and a live AI
+  provider. The assistant in the frontend is a deterministic mock. Existing
+  models for finance and assistant data do not mean those APIs are available.
 
-VibeWealth combines personal finance management with a context-aware AI assistant. Users can track their income and expenses, manage budgets, set savings goals, and receive personalised financial insights.
-
-Unlike a generic chatbot, the AI assistant will use the user's actual financial data, preferences, goals, and relevant conversation history to provide contextual responses.
-
-## Core Features
-
-- User authentication and financial profiles
-- Income and expense tracking
-- Transaction categorisation
-- Monthly budgets
-- Savings goals and progress tracking
-- Financial dashboard and analytics
-- Context-aware AI financial assistant
-- Personalised insights and spending recommendations
-
-## Technology Stack
-
-### Frontend
-- React
-- TypeScript
-- Vite
-- Tailwind CSS
-- shadcn/ui
-- Recharts
-
-### Backend (planned)
-- Python
-- FastAPI
-- SQLAlchemy
-- PostgreSQL
-
-### AI (planned)
-- Google Gemini API / FinGPT
-- Tool calling
-- Context management
-- Conversation memory
-
-## Current Development Status
-
-The project is currently in its frontend development phase.
-
-The initial frontend will use mock financial data and simulated interactions. Backend integration and AI functionality will be implemented in subsequent phases.
+The current backend is a development foundation, not a production launch
+declaration. See the backend guide for security, database, and testing limits.
 
 ## Run the frontend
 
-The frontend lives in `frontend/` and uses npm. With Node.js 20.19+ or 22.12+ installed:
+Use Node.js 24 and npm 11. From the repository root:
 
 ```sh
 cd frontend
-npm install
+npm ci
 npm run dev
 ```
 
-See `frontend/README.md` for TypeScript, lint, and production build checks.
+Frontend checks are listed in [frontend/README.md](frontend/README.md).
 
-## Project Structure
+## Run the backend
 
-- `frontend/` – React application
-- `backend/` – Backend application
-- `docs/` – Requirements and architecture documentation
+The backend setup, local PostgreSQL Compose service, environment configuration,
+migrations, authentication behavior, and PostgreSQL test safeguards are
+documented in [backend/README.md](backend/README.md). The project’s database
+workflow uses Docker Engine and Compose in WSL2 Ubuntu.
 
-## Development Goals
+## Repository layout
 
-Build a polished, responsive, production-oriented personal finance application with a genuinely useful AI assistant.
+- `frontend/` — React prototype and mock finance/assistant services.
+- `backend/` — FastAPI application, SQLAlchemy models, migrations, and tests.
+- `docs/` — product requirements and architecture notes.
 
-## Important Constraints
+## Product constraints
 
-- No direct bank integrations in the initial version.
-- Transactions will be entered manually or imported through CSV.
-- No money transfers or autonomous financial transactions.
-- Financial information must remain private and isolated between users.
+- INR-only launch with money stored as integer paise.
+- No direct bank integration in the initial version; transaction imports are
+  future work.
+- Goal contributions are virtual allocations, separate from income and expense
+  transactions.
+- Financial data must be isolated by authenticated user when backend financial
+  operations are implemented.
+
+## Project documentation
+
+- [Backend setup and API details](backend/README.md)
+- [Frontend setup and structure](frontend/README.md)
+- [Product requirements](docs/requirements.md)
+- [System architecture](docs/architecture.md)

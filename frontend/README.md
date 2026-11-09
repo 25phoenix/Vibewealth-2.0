@@ -1,13 +1,13 @@
 # VibeWealth frontend
 
-The frontend is a React, TypeScript, and Vite application. It currently uses clearly labeled sample INR data and a mock assistant; there is no backend, authentication, or persistent financial storage.
+The frontend is a React, TypeScript, and Vite application. It currently uses clearly labeled sample INR data and a mock assistant. A separate FastAPI backend now has cookie-based authentication, but this frontend is not connected to it and has no sign-in flow or persistent financial storage. Finance records remain in browser memory for the current session; preferences are stored locally.
 
 ## Run locally
 
 Use Node.js 24 and npm 11 (the installed Vite and shadcn CLI versions support this environment). From this directory:
 
 ```sh
-npm install
+npm ci
 npm run dev
 ```
 

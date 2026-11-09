@@ -14,6 +14,7 @@ from sqlalchemy.types import Uuid
 from app.models.base import Base
 
 if TYPE_CHECKING:
+    from app.models.auth_session import AuthSession
     from app.models.account import Account
     from app.models.assistant_conversation import AssistantConversation
     from app.models.assistant_message import AssistantMessage
@@ -71,4 +72,7 @@ class User(Base):
     )
     assistant_messages: Mapped[list[AssistantMessage]] = relationship(
         "AssistantMessage", back_populates="user", passive_deletes="all"
+    )
+    auth_sessions: Mapped[list[AuthSession]] = relationship(
+        "AuthSession", back_populates="user", passive_deletes="all"
     )

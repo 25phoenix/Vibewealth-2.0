@@ -2,6 +2,7 @@
 
 from app.models.base import Base
 from app.models.user import User
+from app.models.auth_session import AuthSession
 from app.models.account import Account
 from app.models.category import Category
 from app.models.transaction import Transaction
@@ -13,6 +14,7 @@ from app.models.assistant_message import AssistantMessage
 
 __all__ = [
     "Account",
+    "AuthSession",
     "AssistantConversation",
     "AssistantMessage",
     "Base",

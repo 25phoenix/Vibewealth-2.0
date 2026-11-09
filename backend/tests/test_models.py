@@ -1,10 +1,11 @@
 """Structural tests for SQLAlchemy model registration and constraints."""
 
-from sqlalchemy import CheckConstraint, ForeignKeyConstraint, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint, PrimaryKeyConstraint, UniqueConstraint
 from sqlalchemy.orm import configure_mappers
 
 from app.models import (
     Account,
+    AuthSession,
     AssistantConversation,
     AssistantMessage,
     Base,
@@ -18,6 +19,7 @@ from app.models import (
 
 
 EXPECTED_TABLES = {
+    "auth_sessions",
     "users",
     "accounts",
     "categories",
@@ -45,16 +47,34 @@ def _indexes(model):
 def test_all_approved_tables_are_registered_on_shared_metadata() -> None:
     assert Base.metadata is User.metadata
     assert {table.name for table in Base.metadata.tables.values()} == EXPECTED_TABLES
-    assert all(model.metadata is Base.metadata for model in (
-        Account, Category, Transaction, Budget, SavingsGoal, GoalEntry,
-        AssistantConversation, AssistantMessage,
-    ))
+    assert all(
+        model.metadata is Base.metadata
+        for model in (
+            AuthSession,
+            Account,
+            Category,
+            Transaction,
+            Budget,
+            SavingsGoal,
+            GoalEntry,
+            AssistantConversation,
+            AssistantMessage,
+        )
+    )
 
 
 def test_models_have_python_uuid_and_server_timestamp_defaults() -> None:
     for model in (
-        User, Account, Category, Transaction, Budget, SavingsGoal, GoalEntry,
-        AssistantConversation, AssistantMessage,
+        User,
+        AuthSession,
+        Account,
+        Category,
+        Transaction,
+        Budget,
+        SavingsGoal,
+        GoalEntry,
+        AssistantConversation,
+        AssistantMessage,
     ):
         assert callable(model.__table__.c.id.default.arg)
         assert model.__table__.c.id.default.arg.__name__ == "uuid4"
@@ -64,6 +84,9 @@ def test_models_have_python_uuid_and_server_timestamp_defaults() -> None:
 def test_relationship_mappers_configure_without_circular_imports() -> None:
     configure_mappers()
     assert User.accounts.property.mapper.class_ is Account
+    assert User.auth_sessions.property.mapper.class_ is AuthSession
+    assert User.auth_sessions.property.passive_deletes == "all"
+    assert AuthSession.user.property.mapper.class_ is User
     assert Transaction.account.property.mapper.class_ is Account
     assert GoalEntry.goal.property.mapper.class_ is SavingsGoal
     assert GoalEntry.account.property.mapper.class_ is Account
@@ -182,3 +205,69 @@ def test_user_email_has_case_insensitive_unique_index() -> None:
     index = _indexes(User)["uq_users_email_lower"]
     assert index.unique is True
     assert "lower(email)" in str(index.expressions[0]).lower()
+
+
+def test_auth_session_schema_and_postgresql_types() -> None:
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.types import LargeBinary, Uuid
+
+    from app.models.auth_session import AuthSession
+
+    table = AuthSession.__table__
+    assert table.name == "auth_sessions"
+    assert tuple(table.columns.keys()) == (
+        "id",
+        "user_id",
+        "token_digest",
+        "created_at",
+        "last_activity_at",
+        "absolute_expires_at",
+        "revoked_at",
+    )
+
+    assert isinstance(table.c.id.type, Uuid)
+    assert table.c.id.primary_key is True
+    assert table.c.id.default.arg.__name__ == "uuid4"
+    assert table.c.user_id.nullable is False
+    assert isinstance(table.c.token_digest.type, LargeBinary)
+    assert table.c.token_digest.type.compile(dialect=postgresql.dialect()) == "BYTEA"
+    assert table.c.token_digest.type.length == 32
+    assert table.c.token_digest.nullable is False
+
+    for name in ("created_at", "last_activity_at", "absolute_expires_at", "revoked_at"):
+        assert table.c[name].type.timezone is True
+    assert table.c.created_at.nullable is False
+    assert table.c.created_at.server_default is not None
+    assert table.c.last_activity_at.nullable is False
+    assert table.c.last_activity_at.server_default is not None
+    assert table.c.absolute_expires_at.nullable is False
+    assert table.c.absolute_expires_at.server_default is None
+    assert table.c.revoked_at.nullable is True
+
+    constraints = {constraint.name: constraint for constraint in table.constraints}
+    primary_key = constraints["pk_auth_sessions"]
+    assert isinstance(primary_key, PrimaryKeyConstraint)
+    assert tuple(column.name for column in primary_key.columns) == ("id",)
+    digest_unique = constraints["uq_auth_sessions_token_digest"]
+    assert isinstance(digest_unique, UniqueConstraint)
+    assert tuple(column.name for column in digest_unique.columns) == ("token_digest",)
+
+    user_fk = constraints["fk_auth_sessions_user_id_users"]
+    assert isinstance(user_fk, ForeignKeyConstraint)
+    assert tuple(column.name for column in user_fk.columns) == ("user_id",)
+    assert tuple(element.target_fullname for element in user_fk.elements) == ("users.id",)
+    assert user_fk.ondelete == "CASCADE"
+    assert user_fk.deferrable is None
+
+    checks = {constraint.name: str(constraint.sqltext) for constraint in table.constraints
+              if isinstance(constraint, CheckConstraint)}
+    assert checks["ck_auth_sessions_token_digest_length"] == "octet_length(token_digest) = 32"
+    assert checks["ck_auth_sessions_absolute_expiry_after_creation"] == (
+        "absolute_expires_at > created_at"
+    )
+
+    index = {item.name: item for item in table.indexes}["ix_auth_sessions_user_active_expiry"]
+    assert tuple(column.name for column in index.columns) == ("user_id", "absolute_expires_at")
+    assert index.unique is False
+    assert str(index.dialect_options["postgresql"]["where"]) == "revoked_at IS NULL"
+    assert str(index.dialect_options["sqlite"]["where"]) == "revoked_at IS NULL"

@@ -13,6 +13,7 @@ from app.core.config import Settings
 def test_database_url_uses_url_create_for_password_with_special_characters() -> None:
     settings = Settings(
         _env_file=None,
+        app_environment="test",
         database_url=None,
         postgres_db="test_db",
         postgres_user="test_user",
@@ -42,6 +43,7 @@ def test_supplied_database_url_is_parsed_and_preserved() -> None:
     )
     settings = Settings(
         _env_file=None,
+        app_environment="test",
         database_url=supplied_url.render_as_string(hide_password=False),
     )
 
@@ -52,7 +54,11 @@ def test_invalid_database_url_is_rejected() -> None:
     from pydantic import ValidationError
 
     with pytest.raises(ValidationError):
-        Settings(_env_file=None, database_url="sqlite:///not-postgres.db")
+        Settings(
+            _env_file=None,
+            app_environment="test",
+            database_url="sqlite:///not-postgres.db",
+        )
 
 
 def test_sqlalchemy_connection_can_execute_select_one() -> None:
