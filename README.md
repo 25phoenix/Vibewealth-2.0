@@ -16,11 +16,15 @@ the backend.
   models and migrations for users, accounts, categories, transactions, budgets,
   savings goals and entries, assistant conversations and messages, and
   authentication sessions. Cookie-based registration, login, current-user,
-  CSRF-token, and logout endpoints are implemented, along with health endpoints.
-- **Not implemented yet:** frontend-to-backend integration, financial CRUD/API
-  operations, account recovery, a persistent assistant service, and a live AI
-  provider. The assistant in the frontend is a deterministic mock. Existing
-  models for finance and assistant data do not mean those APIs are available.
+  CSRF-token, and logout endpoints are implemented, along with authenticated
+  account, category-selection, and transaction endpoints and health endpoints.
+  Transactions can be filtered and paginated, and account balances use
+  integer-paise arithmetic.
+- **Not implemented yet:** frontend-to-backend integration, budget and
+  savings-goal APIs, transaction editing/deletion, account creation/deletion,
+  account recovery, a persistent assistant service, and a live AI provider.
+  The assistant in the frontend is a deterministic mock. Existing models for
+  finance and assistant data do not mean those APIs are available.
 
 The current backend is a development foundation, not a production launch
 declaration. See the backend guide for security, database, and testing limits.

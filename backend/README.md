@@ -6,13 +6,13 @@ categories, transactions, budgets, savings goals and entries, assistant
 conversations and messages, and authentication sessions. It provides health
 endpoints and cookie-based registration, login, current-user, CSRF-token, and
 logout endpoints. Authentication uses Argon2id password hashes and
-PostgreSQL-backed opaque sessions. Financial CRUD APIs, a persistent assistant
+PostgreSQL-backed opaque sessions. Full financial CRUD, a persistent assistant
 service, and live AI integration are not implemented. Schema changes are
 managed explicitly with Alembic.
 
-This authentication layer is not a declaration of public launch readiness.
-Account ownership authorization, account recovery, production deployment
-configuration, and a broader security review remain separate work.
+This backend is not a declaration of public launch readiness. Budget and
+savings-goal APIs, account recovery, production deployment configuration, and a
+broader security review remain separate work.
 
 ## Requirements
 
@@ -108,7 +108,7 @@ uvicorn app.main:app --reload
 
 The API is available at `http://127.0.0.1:8000`. `GET /health` checks the API
 process; `GET /health/db` runs `SELECT 1` and returns 503 if PostgreSQL is not
-reachable. Authentication endpoints are under `/api/auth`:
+reachable. Current endpoints are:
 
 | Method | Path | Behavior |
 | --- | --- | --- |
@@ -119,9 +119,63 @@ reachable. Authentication endpoints are under `/api/auth`:
 | `GET` | `/api/auth/me` | Returns the authenticated user projection |
 | `GET` | `/api/auth/csrf` | Returns a session-bound CSRF token |
 | `POST` | `/api/auth/logout` | Revokes the current session and clears its cookie |
+| `GET` | `/api/accounts` | Lists the user's active accounts and current balances |
+| `GET` | `/api/accounts/{account_id}` | Retrieves one owned account and its current balance |
+| `GET` | `/api/accounts/{account_id}/balance?as_of=YYYY-MM-DD` | Calculates a current or historical balance; `as_of` is optional |
+| `PATCH` | `/api/accounts/{account_id}` | Updates account name/type and, before the first transaction, opening balance/date |
+| `GET` | `/api/categories` | Lists the authenticated user's active categories for selection |
+| `POST` | `/api/transactions` | Creates an income or expense transaction; requires CSRF protection |
+| `GET` | `/api/transactions` | Lists live transactions with filters and pagination |
+| `GET` | `/api/transactions/{transaction_id}` | Retrieves one owned live transaction |
+
+Account and transaction reads require a valid session. Category reads also
+require a valid session; category listing excludes archived categories and
+other users' categories. Account updates and transaction creation also require
+the trusted Origin and session-bound CSRF header. Account
+creation/deletion and transaction editing/deletion endpoints are not exposed.
+Registration remains the only account-creation path and
+creates one default cash, bank, or wallet account with a zero opening balance.
+
+## Account balances and transaction rules
+
+`opening_balance_paise` is the account's starting balance at the beginning of
+`opening_balance_as_of`. Transactions dated that day are added to it. A current
+or historical balance is the opening balance plus non-deleted income minus
+non-deleted expenses dated from the opening date through the requested date.
+Historical balance requests before the opening date or after today are
+rejected. Amounts and calculations stay in integer paise; transaction inputs
+must be positive integers within JavaScript's safe-integer range. Every daily
+closing balance must also remain in that range. A backdated transaction is
+rejected if it would make any affected daily closing balance unsafe, even when
+the current balance would remain safe.
+
+Transaction creation requires an account and category owned by the authenticated
+user. The category must be active and its type must match the transaction type.
+Archived categories remain visible by name on historical transactions but are
+rejected for new transactions. Dates cannot be in the future or before the
+account opening date. Deleted transactions are omitted from history and every
+balance calculation.
+
+Account name and asset type (`cash`, `bank`, or `wallet`) can be changed. The
+opening balance and date may be changed only before any transaction has ever
+been created for the account; soft-deleting a transaction does not unlock them.
+Account updates and transaction creation acquire the account row lock first, so
+concurrent writes serialize around that invariant. Services stage database
+changes without committing; the HTTP request owns commit and rollback.
+
+The account balance is not available-to-spend. Goal allocations do not yet have
+an API and are not included in this balance; available-to-spend will be defined
+with the later savings-goal phase.
+
+Transaction listing supports `account_id`, `transaction_type`, `category_id`,
+`date_from`, `date_to`, `offset`, and `limit` query parameters. Results exclude
+soft-deleted rows and sort by transaction date, creation time, and UUID in
+descending order. `offset` defaults to 0; `limit` defaults to 50 and is capped
+at 100.
 
 Registration creates the user, their one default asset account, seeded
-categories, and initial session in one database transaction. Login errors are
+categories, and initial session in one database transaction. That account starts
+with a zero opening balance dated yesterday in `Asia/Kolkata`. Login errors are
 generic for unknown users and incorrect passwords. Both issue an `HttpOnly`,
 `SameSite=Lax` cookie; production additionally requires `Secure` and uses the
 host-only `__Host-` cookie name. The session token contains 256 bits of random
@@ -163,9 +217,9 @@ the server-side idle and absolute expiration checks remain authoritative.
 Missing or invalid sessions return 401; an authenticated request with an
 untrusted origin or missing/invalid CSRF header returns 403.
 
-CORS allows only the exact configured frontend origins, credentials, `GET` and
-`POST`, and the `Content-Type` and `X-CSRF-Token` headers. CORS is a browser
-policy; the server independently checks Origin/Referer on registration/login
+CORS allows only the exact configured frontend origins, credentials, `GET`,
+`POST`, and `PATCH`, and the `Content-Type` and `X-CSRF-Token` headers. CORS is
+a browser policy; the server independently checks Origin/Referer on registration/login
 and Origin plus CSRF on logout.
 
 ## Run tests

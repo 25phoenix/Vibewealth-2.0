@@ -307,17 +307,27 @@ def test_cors_preflight_is_limited_to_explicit_origin_and_auth_headers():
                 "Access-Control-Request-Method": "POST",
             },
         )
+        account_patch = client.options(
+            "/api/accounts/00000000-0000-0000-0000-000000000001",
+            headers={
+                "Origin": FRONTEND_ORIGIN,
+                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Headers": "content-type,x-csrf-token",
+            },
+        )
         rejected_method = client.options(
             "/api/auth/login",
             headers={
                 "Origin": FRONTEND_ORIGIN,
-                "Access-Control-Request-Method": "PATCH",
+                "Access-Control-Request-Method": "DELETE",
             },
         )
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == FRONTEND_ORIGIN
     assert response.headers["access-control-allow-credentials"] == "true"
+    assert account_patch.status_code == 200
+    assert "PATCH" in account_patch.headers["access-control-allow-methods"]
     assert "x-csrf-token" in response.headers["access-control-allow-headers"].lower()
     assert "POST" in response.headers["access-control-allow-methods"]
     assert rejected.status_code == 400

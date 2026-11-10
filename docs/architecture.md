@@ -3,9 +3,11 @@
 
 ## 1. Overview
 
-VibeWealth follows a modular client-server architecture.
-
-The frontend communicates with a backend API, which handles authentication, financial operations, database access, and AI orchestration.
+VibeWealth has a frontend prototype and a separately implemented FastAPI
+backend. The frontend continues to use mock finance and assistant services; it
+does not yet call the backend. The backend provides PostgreSQL-backed
+authentication, account reads/metadata updates, and income/expense transaction
+operations. Budget, savings-goal, and AI operations remain future work.
 
 ## 2. Frontend Architecture
 
@@ -36,7 +38,10 @@ Current implementation:
 - `src/index.css` owns semantic design tokens, including light/dark surfaces, brand, status, and chart colors. Components consume those tokens so a later Hallmark redesign can change presentation without changing finance logic.
 - Financial amounts use integer paise throughout the domain and are formatted only at the presentation boundary.
 
-Financial edits currently update in-memory state for the browser session. Preferences use local browser storage. There is no API, authentication, or server persistence yet.
+Financial edits in the frontend currently update in-memory mock state for the
+browser session. Preferences use local browser storage. The separate backend
+has authentication and account/transaction APIs, but the frontend has no
+authentication flow or API repository wired to them.
 
 ### Pre-backend integration contract
 
@@ -68,7 +73,7 @@ frontend/src/
 - mocks/
 - lib/
 
-## 3. Backend Architecture (Planned)
+## 3. Backend Architecture (Implemented Foundation)
 
 Technology:
 - Python
@@ -76,30 +81,42 @@ Technology:
 - SQLAlchemy
 - PostgreSQL
 
-Responsibilities:
-- Authentication and authorisation.
-- Transaction management.
-- Budget management.
-- Savings goal calculations.
-- Financial analytics.
-- AI assistant orchestration.
+Implemented responsibilities:
+- Cookie-based registration, login, current-user lookup, CSRF-token, and logout
+  operations.
+- Tenant-scoped account listing, retrieval, balance calculation, and permitted
+  metadata updates.
+- Tenant-scoped listing of active categories for transaction selection.
+- Tenant-scoped income/expense creation, retrieval, filtering, and pagination.
+- Integer-paise balances with soft-deleted transactions excluded.
+- PostgreSQL schema management through Alembic.
 
-## 4. Database Architecture (Planned)
+Budget and savings-goal APIs, broader financial analytics, and AI orchestration
+are not implemented.
 
-Primary entities:
+## 4. Database Architecture (Current Schema)
 
-- Users
-- User Profiles
-- Transactions
-- Budgets
-- Savings Goals
-- Chat Sessions
-- Chat Messages
-- User Memories
+Registered SQLAlchemy entities:
 
-All financial records must be associated with their authenticated user.
+- Users and authentication sessions.
+- Accounts, categories, and transactions.
+- Budgets, savings goals, and goal entries.
+- Assistant conversations and messages.
 
-Money should be stored using integer minor units (paise), not floating-point values.
+Financial models have user ownership constraints. Account and transaction
+services also scope every query to the authenticated user. Registration creates
+one default cash, bank, or wallet account with a zero opening balance and seeds
+per-user categories. Additional account creation and account deletion are not
+exposed by the current API.
+
+Money is stored and calculated in integer paise. An account's opening balance
+is the starting balance at the beginning of `opening_balance_as_of`; transactions
+on that date are included. Current and historical balances add live income and
+subtract live expenses through the requested date. Deleted transactions are
+excluded. Transaction creation checks the resulting closing balance for every
+affected date through today against JavaScript's safe-integer range using
+integer paise. Goal allocations are not part of account balances or transaction
+totals; available-to-spend awaits the savings-goal phase.
 
 ## 5. AI Architecture (Planned)
 
@@ -145,10 +162,20 @@ This will allow mock services to be replaced with real API services later.
 ## 8. Security
 
 - API keys must never be exposed in frontend code.
-- Backend endpoints must enforce authentication.
-- Financial data access must be scoped to the authenticated user.
+- Account and transaction reads require an authenticated session, and their
+  database queries are scoped to that user.
+- Account metadata updates and transaction creation require trusted Origin and
+  CSRF validation.
+- Registration and login require exact Origin/Referer validation and use
+  bounded process-local rate limits.
+- PostgreSQL account row locks serialize opening-balance changes with
+  transaction creation.
 - AI tools must not have unrestricted database access.
 - Financial write operations must require explicit confirmation.
+
+The frontend is not connected to the authenticated API yet. The backend
+rate-limit state is process-local and requires a single process/replica until a
+shared store is introduced.
 
 ## 9. Deployment (Planned)
 

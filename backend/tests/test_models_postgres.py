@@ -43,6 +43,9 @@ from app.services.auth_sessions import (
 from app.services.authentication import AuthenticationError, get_current_user, login_user
 from app.services import registration
 from app.services.registration import DuplicateEmailError, register_user
+from app.core.financial import financial_today
+from app.services.accounts import AccountOpeningBalanceLockedError, update_account
+from app.services.transactions import create_transaction
 
 
 @pytest.fixture
@@ -138,6 +141,15 @@ def _make_financial_user(session: Session) -> tuple[User, Account, Category]:
     session.add_all([account, category])
     session.flush()
     return user, account, category
+
+
+def _authenticated_finance_headers(client, settings, session, user):
+    token, _ = create_session(session, user.id)
+    session.commit()
+    client.cookies.set(settings.auth_cookie_name, token)
+    response = client.get("/api/auth/csrf")
+    assert response.status_code == 200
+    return {**_origin_headers(), "X-CSRF-Token": response.json()["csrf_token"]}
 
 
 def test_postgresql_uuid_timestamp_and_account_defaults(postgres_model_session):
@@ -1525,3 +1537,491 @@ def test_http_logout_requires_valid_session_before_csrf(auth_http_client, header
     client, settings, _ = auth_http_client
     response = client.post("/api/auth/logout", headers=headers)
     assert response.status_code == 401
+
+
+def test_http_account_and_transaction_balances_filters_and_soft_deletes(auth_http_client):
+    client, settings, session = auth_http_client
+    user, account, expense_category = _make_financial_user(session)
+    income_category = Category(
+        user_id=user.id, name="Pay", transaction_type="income"
+    )
+    session.add(income_category)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    opening_date = account.opening_balance_as_of
+    later_date = opening_date + timedelta(days=1)
+
+    income = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account.id),
+            "category_id": str(income_category.id),
+            "transaction_type": "income",
+            "amount_paise": 10000,
+            "description": "Pay",
+            "transaction_date": opening_date.isoformat(),
+        },
+    )
+    expense = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account.id),
+            "category_id": str(expense_category.id),
+            "transaction_type": "expense",
+            "amount_paise": 2500,
+            "description": "Groceries",
+            "transaction_date": opening_date.isoformat(),
+        },
+    )
+    later_expense = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account.id),
+            "category_id": str(expense_category.id),
+            "transaction_type": "expense",
+            "amount_paise": 1000,
+            "description": "Transit",
+            "transaction_date": later_date.isoformat(),
+        },
+    )
+
+    assert income.status_code == expense.status_code == later_expense.status_code == 201
+    assert income.json()["category_name"] == "Pay"
+    assert expense.json()["amount_paise"] == 2500
+    auth_session = session.scalar(
+        select(AuthSession).where(AuthSession.user_id == user.id)
+    )
+    activity_before_account_read = auth_session.last_activity_at
+    current = client.get("/api/accounts")
+    session.refresh(auth_session)
+    assert auth_session.last_activity_at >= activity_before_account_read
+    detail = client.get(f"/api/accounts/{account.id}")
+    balance_at_open = client.get(
+        f"/api/accounts/{account.id}/balance?as_of={opening_date.isoformat()}"
+    )
+    balance_current = client.get(f"/api/accounts/{account.id}/balance")
+    assert current.status_code == detail.status_code == 200
+    assert current.json()[0]["balance_paise"] == 6500
+    assert detail.json()["balance_paise"] == 6500
+    assert balance_at_open.json() == {
+        "account_id": str(account.id),
+        "balance_paise": 7500,
+        "as_of": opening_date.isoformat(),
+    }
+    assert balance_current.json()["balance_paise"] == 6500
+    assert current.headers["cache-control"] == "no-store"
+
+    deleted = Transaction(
+        user_id=user.id,
+        account_id=account.id,
+        category_id=expense_category.id,
+        transaction_type="expense",
+        amount_paise=9900,
+        description="Soft deleted",
+        transaction_date=later_date,
+        deleted_at=datetime.now(timezone.utc),
+    )
+    session.add(deleted)
+    session.commit()
+    assert client.get(f"/api/accounts/{account.id}/balance").json()["balance_paise"] == 6500
+
+    transaction_list = client.get(
+        "/api/transactions",
+        params={
+            "account_id": str(account.id),
+            "transaction_type": "expense",
+            "category_id": str(expense_category.id),
+            "date_from": opening_date.isoformat(),
+            "date_to": later_date.isoformat(),
+            "limit": 1,
+            "offset": 1,
+        },
+    )
+    assert transaction_list.status_code == 200
+    assert transaction_list.json()["total"] == 2
+    assert len(transaction_list.json()["items"]) == 1
+    assert transaction_list.json()["items"][0]["id"] == expense.json()["id"]
+    assert transaction_list.json()["items"][0]["category_name"] == "Food"
+    assert transaction_list.headers["cache-control"] == "no-store"
+    income_id = income.json()["id"]
+    assert client.get(f"/api/transactions/{income_id}").status_code == 200
+    assert client.get(f"/api/transactions/{deleted.id}").status_code == 404
+
+
+def test_http_financial_routes_reject_cross_user_ids_and_categories(auth_http_client):
+    client, settings, session = auth_http_client
+    user_a, account_a, expense_a = _make_financial_user(session)
+    user_b, account_b, expense_b = _make_financial_user(session)
+    session.commit()
+    transaction_b = Transaction(
+        user_id=user_b.id,
+        account_id=account_b.id,
+        category_id=expense_b.id,
+        transaction_type="expense",
+        amount_paise=500,
+        description="Private transaction",
+        transaction_date=account_b.opening_balance_as_of,
+    )
+    session.add(transaction_b)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user_a)
+
+    assert client.get(f"/api/accounts/{account_b.id}").status_code == 404
+    assert client.get(f"/api/transactions/{transaction_b.id}").status_code == 404
+    assert client.get(
+        "/api/transactions", params={"account_id": str(account_b.id)}
+    ).json()["total"] == 0
+
+    foreign_account = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account_b.id),
+            "category_id": str(expense_a.id),
+            "transaction_type": "expense",
+            "amount_paise": 100,
+            "description": "Attempt",
+            "transaction_date": account_a.opening_balance_as_of.isoformat(),
+        },
+    )
+    foreign_category = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account_a.id),
+            "category_id": str(expense_b.id),
+            "transaction_type": "expense",
+            "amount_paise": 100,
+            "description": "Attempt",
+            "transaction_date": account_a.opening_balance_as_of.isoformat(),
+        },
+    )
+    assert foreign_account.status_code == 404
+    assert foreign_category.status_code == 422
+
+
+def test_http_category_list_is_active_and_tenant_scoped(auth_http_client):
+    client, settings, session = auth_http_client
+    user_a, _, _ = _make_financial_user(session)
+    user_b, _, _ = _make_financial_user(session)
+    own_active = Category(
+        user_id=user_a.id, name="Travel", transaction_type="expense"
+    )
+    own_archived = Category(
+        user_id=user_a.id,
+        name="Old category",
+        transaction_type="expense",
+        archived_at=datetime.now(timezone.utc),
+    )
+    foreign_active = Category(
+        user_id=user_b.id, name="Private", transaction_type="income"
+    )
+    session.add_all([own_active, own_archived, foreign_active])
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user_a)
+
+    response = client.get("/api/categories", headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    returned = response.json()
+    returned_ids = {item["id"] for item in returned}
+    assert str(own_active.id) in returned_ids
+    assert str(own_archived.id) not in returned_ids
+    assert str(foreign_active.id) not in returned_ids
+    assert all(set(item) == {"id", "name", "transaction_type"} for item in returned)
+
+
+def test_historical_daily_balances_stay_within_javascript_safe_integer(auth_http_client):
+    client, settings, session = auth_http_client
+    user, account, expense_category = _make_financial_user(session)
+    today = financial_today()
+    day_one = today - timedelta(days=2)
+    day_two = today - timedelta(days=1)
+    account.opening_balance_paise = 0
+    account.opening_balance_as_of = day_one
+    income_category = Category(
+        user_id=user.id, name="Income", transaction_type="income"
+    )
+    session.add(income_category)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    maximum = 2**53 - 1
+
+    def post(category_id, transaction_type, amount_paise, transaction_date):
+        return client.post(
+            "/api/transactions",
+            headers=headers,
+            json={
+                "account_id": str(account.id),
+                "category_id": str(category_id),
+                "transaction_type": transaction_type,
+                "amount_paise": amount_paise,
+                "description": "Boundary entry",
+                "transaction_date": transaction_date.isoformat(),
+            },
+        )
+
+    # The positive and negative limits are both valid daily closing balances.
+    assert post(income_category.id, "income", maximum, day_one).status_code == 201
+    assert post(expense_category.id, "expense", maximum, day_two).status_code == 201
+    assert post(expense_category.id, "expense", maximum, today).status_code == 201
+
+    day_one_balance = client.get(
+        f"/api/accounts/{account.id}/balance?as_of={day_one.isoformat()}"
+    )
+    day_two_balance = client.get(
+        f"/api/accounts/{account.id}/balance?as_of={day_two.isoformat()}"
+    )
+    today_balance = client.get(f"/api/accounts/{account.id}/balance")
+    assert day_one_balance.json()["balance_paise"] == maximum
+    assert day_two_balance.json()["balance_paise"] == 0
+    assert today_balance.json()["balance_paise"] == -maximum
+
+    # This backdated income would make day one 2 * maximum while leaving the
+    # current balance at zero. It must be rejected based on the intermediate day.
+    intermediate_overflow = post(
+        income_category.id, "income", maximum, day_one
+    )
+    assert intermediate_overflow.status_code == 422
+    assert "daily account balance" in intermediate_overflow.json()["detail"]
+
+    # Each inclusive boundary is checked independently, including one paise over.
+    positive_overflow = post(income_category.id, "income", 1, day_one)
+    negative_overflow = post(expense_category.id, "expense", 1, today)
+    assert positive_overflow.status_code == negative_overflow.status_code == 422
+
+    # Rejected writes are rolled back at the HTTP boundary, and the session can
+    # still query the database and return the original historical balances.
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user.id
+        )
+    ) == 3
+    final_balances = [
+        day_one_balance.json()["balance_paise"],
+        day_two_balance.json()["balance_paise"],
+        today_balance.json()["balance_paise"],
+    ]
+    assert all(-maximum <= balance <= maximum for balance in final_balances)
+    assert client.get(
+        f"/api/accounts/{account.id}/balance?as_of={day_one.isoformat()}"
+    ).json()["balance_paise"] == maximum
+
+
+def test_soft_deleted_transactions_do_not_affect_safe_balance_validation(
+    auth_http_client,
+):
+    client, settings, session = auth_http_client
+    user, account, _ = _make_financial_user(session)
+    today = financial_today()
+    account.opening_balance_as_of = today
+    maximum = 2**53 - 1
+    income_category = Category(
+        user_id=user.id, name="Income", transaction_type="income"
+    )
+    session.add(income_category)
+    session.flush()
+    deleted_transaction = Transaction(
+        user_id=user.id,
+        account_id=account.id,
+        category_id=income_category.id,
+        transaction_type="income",
+        amount_paise=maximum,
+        description="Deleted import",
+        transaction_date=today,
+        deleted_at=datetime.now(timezone.utc),
+    )
+    session.add(deleted_transaction)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+
+    active_transaction = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account.id),
+            "category_id": str(income_category.id),
+            "transaction_type": "income",
+            "amount_paise": maximum,
+            "description": "Live income",
+            "transaction_date": today.isoformat(),
+        },
+    )
+
+    assert active_transaction.status_code == 201
+    balance = client.get(f"/api/accounts/{account.id}/balance")
+    assert balance.status_code == 200
+    assert balance.json()["balance_paise"] == maximum
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user.id,
+            Transaction.deleted_at.is_(None),
+        )
+    ) == 1
+
+
+@pytest.mark.parametrize("invalid_case", ["type", "archived", "future", "before_opening"])
+def test_http_transaction_creation_rejects_invalid_category_and_dates(
+    auth_http_client, invalid_case
+):
+    client, settings, session = auth_http_client
+    user, account, expense_category = _make_financial_user(session)
+    income_category = Category(
+        user_id=user.id, name="Salary", transaction_type="income"
+    )
+    archived_category = Category(
+        user_id=user.id,
+        name="Archived",
+        transaction_type="expense",
+        archived_at=datetime.now(timezone.utc),
+    )
+    session.add_all([income_category, archived_category])
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    category_id = expense_category.id
+    transaction_type = "expense"
+    transaction_date = account.opening_balance_as_of
+    if invalid_case == "type":
+        category_id = expense_category.id
+        transaction_type = "income"
+    elif invalid_case == "archived":
+        category_id = archived_category.id
+    elif invalid_case == "future":
+        transaction_date = financial_today() + timedelta(days=1)
+    else:
+        transaction_date = account.opening_balance_as_of - timedelta(days=1)
+
+    response = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account.id),
+            "category_id": str(category_id),
+            "transaction_type": transaction_type,
+            "amount_paise": 100,
+            "description": "Rejected entry",
+            "transaction_date": transaction_date.isoformat(),
+        },
+    )
+    assert response.status_code == 422
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(Transaction.user_id == user.id)
+    ) == 0
+
+
+def test_account_opening_balance_locks_after_even_a_soft_deleted_transaction(auth_http_client):
+    client, settings, session = auth_http_client
+    user, account, expense_category = _make_financial_user(session)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+
+    metadata = client.patch(
+        f"/api/accounts/{account.id}",
+        headers=headers,
+        json={
+            "name": "Everyday",
+            "account_type": "wallet",
+            "opening_balance_paise": 2500,
+        },
+    )
+    assert metadata.status_code == 200
+    assert metadata.json()["name"] == "Everyday"
+    assert metadata.json()["account_type"] == "wallet"
+    assert metadata.json()["balance_paise"] == 2500
+
+    created = client.post(
+        "/api/transactions",
+        headers=headers,
+        json={
+            "account_id": str(account.id),
+            "category_id": str(expense_category.id),
+            "transaction_type": "expense",
+            "amount_paise": 100,
+            "description": "First transaction",
+            "transaction_date": account.opening_balance_as_of.isoformat(),
+        },
+    )
+    assert created.status_code == 201
+    changed = client.patch(
+        f"/api/accounts/{account.id}",
+        headers=headers,
+        json={"opening_balance_paise": 3000},
+    )
+    assert changed.status_code == 409
+
+    session.execute(
+        update(Transaction)
+        .where(Transaction.id == UUID(created.json()["id"]))
+        .values(deleted_at=datetime.now(timezone.utc))
+    )
+    session.commit()
+    still_locked = client.patch(
+        f"/api/accounts/{account.id}",
+        headers=headers,
+        json={"opening_balance_as_of": "2026-01-02"},
+    )
+    assert still_locked.status_code == 409
+
+
+def test_concurrent_opening_balance_edit_and_transaction_creation_are_serialized(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, category = _make_financial_user(session)
+    session.commit()
+    barrier = Barrier(2)
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    today = financial_today()
+
+    def create_entry():
+        with factory() as worker:
+            barrier.wait()
+            record = create_transaction(
+                worker,
+                user_id=user.id,
+                account_id=account.id,
+                category_id=category.id,
+                transaction_type="expense",
+                amount_paise=100,
+                description="Concurrent transaction",
+                transaction_date=today,
+            )
+            worker.commit()
+            return record.transaction.id
+
+    def edit_opening_balance():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                update_account(
+                    worker,
+                    user_id=user.id,
+                    account_id=account.id,
+                    changes={"opening_balance_paise": 250},
+                )
+                worker.commit()
+                return "updated"
+            except AccountOpeningBalanceLockedError:
+                worker.rollback()
+                return "locked"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        transaction_future = executor.submit(create_entry)
+        opening_future = executor.submit(edit_opening_balance)
+        transaction_id = transaction_future.result(timeout=30)
+        opening_result = opening_future.result(timeout=30)
+
+    assert transaction_id is not None
+    assert opening_result in {"updated", "locked"}
+    session.expire_all()
+    persisted = session.get(Account, account.id)
+    assert persisted.opening_balance_paise in {0, 250}
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(Transaction.account_id == account.id)
+    ) == 1

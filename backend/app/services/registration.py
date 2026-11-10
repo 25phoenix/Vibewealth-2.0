@@ -6,20 +6,19 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Final
 from uuid import UUID
-from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.email import normalize_email
+from app.core.financial import FINANCIAL_TIMEZONE
 from app.core.security import hash_password, validate_password
 from app.models import Account, Category, User
 from app.services.auth_sessions import create_session
 
 EMAIL_UNIQUE_INDEX: Final = "uq_users_email_lower"
 SUPPORTED_ACCOUNT_TYPES: Final = frozenset({"cash", "bank", "wallet"})
-FINANCIAL_TIMEZONE: Final = ZoneInfo("Asia/Kolkata")
 EXPENSE_CATEGORIES: Final = (
     "Housing",
     "Groceries",
