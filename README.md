@@ -18,13 +18,17 @@ the backend.
   authentication sessions. Cookie-based registration, login, current-user,
   CSRF-token, and logout endpoints are implemented, along with authenticated
   account, category-selection, and transaction endpoints and health endpoints.
-  Transactions can be filtered and paginated, and account balances use
-  integer-paise arithmetic.
-- **Not implemented yet:** frontend-to-backend integration, budget and
-  savings-goal APIs, transaction editing/deletion, account creation/deletion,
+  Tenant-scoped monthly budget APIs and savings-goal/allocation-ledger APIs are
+  also available. Transactions can be filtered and paginated, and account
+  balances and budget totals use integer-paise arithmetic. Budget API limits are
+  JSON integers; potentially large spending, remaining, and basis-point totals
+  are returned as exact decimal strings.
+- **Not implemented yet:** frontend-to-backend integration,
+  transaction editing/deletion, account creation/deletion,
   account recovery, a persistent assistant service, and a live AI provider.
-  The assistant in the frontend is a deterministic mock. Existing models for
-  finance and assistant data do not mean those APIs are available.
+  The assistant in the frontend is a deterministic mock. The implemented
+  account, transaction, budget, and savings-goal APIs are not connected to the
+  frontend yet.
 
 The current backend is a development foundation, not a production launch
 declaration. See the backend guide for security, database, and testing limits.
@@ -61,8 +65,7 @@ workflow uses Docker Engine and Compose in WSL2 Ubuntu.
   future work.
 - Goal contributions are virtual allocations, separate from income and expense
   transactions.
-- Financial data must be isolated by authenticated user when backend financial
-  operations are implemented.
+- Financial data operations are scoped to the authenticated user by the backend.
 
 ## Project documentation
 

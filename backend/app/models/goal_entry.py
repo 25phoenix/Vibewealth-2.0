@@ -58,6 +58,13 @@ class GoalEntry(Base):
             "goal_id",
             "effective_date",
         ),
+        Index(
+            "ix_goal_entries_user_goal_created",
+            "user_id",
+            "goal_id",
+            "created_at",
+            "id",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), default=uuid4)

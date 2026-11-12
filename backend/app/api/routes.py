@@ -8,13 +8,17 @@ from sqlalchemy.orm import Session
 
 from app.api.auth_routes import router as auth_router
 from app.api.account_routes import router as account_router
+from app.api.budget_routes import router as budget_router
 from app.api.category_routes import router as category_router
+from app.api.goal_routes import router as goal_router
 from app.api.transaction_routes import router as transaction_router
 from app.core.database import get_db
 
 router = APIRouter()
 router.include_router(auth_router)
 router.include_router(account_router)
+router.include_router(budget_router)
+router.include_router(goal_router)
 router.include_router(category_router)
 router.include_router(transaction_router)
 

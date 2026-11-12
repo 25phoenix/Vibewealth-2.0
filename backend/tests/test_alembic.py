@@ -53,17 +53,21 @@ def test_autogeneration_ignores_unmodeled_reflected_tables() -> None:
     assert include_object(object(), "new_table", "table", False, None) is True
 
 
-def test_auth_session_migration_follows_initial_revision() -> None:
+def test_goal_migration_follows_auth_session_revision() -> None:
     script_directory = ScriptDirectory.from_config(load_alembic_config())
 
     revisions = list(script_directory.walk_revisions())
-    assert len(revisions) == 2
+    assert len(revisions) == 3
     assert script_directory.get_heads() == [revisions[0].revision]
-    assert revisions[0].down_revision == "4da570f34c63"
-    assert revisions[0].doc == "add authentication sessions"
-    assert revisions[1].revision == "4da570f34c63"
-    assert revisions[1].down_revision is None
-    assert revisions[1].doc == "initial schema"
+    assert revisions[0].revision == "6b9c2f1d4a80"
+    assert revisions[0].down_revision == "e7a30067c81c"
+    assert revisions[0].doc == "add goal descriptions and goal-scoped ledger index"
+    assert revisions[1].revision == "e7a30067c81c"
+    assert revisions[1].down_revision == "4da570f34c63"
+    assert revisions[1].doc == "add authentication sessions"
+    assert revisions[2].revision == "4da570f34c63"
+    assert revisions[2].down_revision is None
+    assert revisions[2].doc == "initial schema"
 
 
 def test_upgrade_and_downgrade_use_isolated_sqlite_database(tmp_path: Path) -> None:

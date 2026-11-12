@@ -10,7 +10,7 @@ from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from app.core.financial import MAX_SAFE_PAISE, financial_today
-from app.models import Account, Transaction
+from app.models import Account, GoalEntry, Transaction
 
 
 class AccountNotFoundError(LookupError):
@@ -30,6 +30,8 @@ class AccountSnapshot:
     account: Account
     balance_paise: int
     as_of: date
+    goal_allocated_paise: int = 0
+    available_to_spend_paise: int = 0
 
 
 def list_accounts(db: Session, *, user_id: UUID) -> list[AccountSnapshot]:
@@ -38,8 +40,14 @@ def list_accounts(db: Session, *, user_id: UUID) -> list[AccountSnapshot]:
     as_of = financial_today()
     rows = _account_balance_query(db, user_id=user_id, as_of=as_of)
     return [
-        AccountSnapshot(account=account, balance_paise=balance, as_of=as_of)
-        for account, balance in rows
+        AccountSnapshot(
+            account=account,
+            balance_paise=balance,
+            as_of=as_of,
+            goal_allocated_paise=allocated,
+            available_to_spend_paise=available,
+        )
+        for account, balance, allocated, available in rows
     ]
 
 
@@ -54,12 +62,23 @@ def get_account(
     )
     if not rows:
         raise AccountNotFoundError
-    account, balance = rows[0]
-    return AccountSnapshot(account=account, balance_paise=balance, as_of=as_of)
+    account, balance, allocated, available = rows[0]
+    return AccountSnapshot(
+        account=account,
+        balance_paise=balance,
+        as_of=as_of,
+        goal_allocated_paise=allocated,
+        available_to_spend_paise=available,
+    )
 
 
 def get_account_balance(
-    db: Session, *, user_id: UUID, account_id: UUID, as_of: date | None = None
+    db: Session,
+    *,
+    user_id: UUID,
+    account_id: UUID,
+    as_of: date | None = None,
+    include_archived: bool = False,
 ) -> AccountSnapshot:
     """Calculate the exact balance through the requested India-calendar date."""
 
@@ -67,17 +86,25 @@ def get_account_balance(
     if effective_date > financial_today():
         raise InvalidAccountUpdateError("Balance date cannot be in the future")
     rows = _account_balance_query(
-        db, user_id=user_id, account_id=account_id, as_of=effective_date
+        db,
+        user_id=user_id,
+        account_id=account_id,
+        as_of=effective_date,
+        include_archived=include_archived,
     )
     if not rows:
         raise AccountNotFoundError
-    account, balance = rows[0]
+    account, balance, allocated, available = rows[0]
     if effective_date < account.opening_balance_as_of:
         raise InvalidAccountUpdateError(
             "Balance cannot be calculated before the account opening date"
         )
     return AccountSnapshot(
-        account=account, balance_paise=balance, as_of=effective_date
+        account=account,
+        balance_paise=balance,
+        as_of=effective_date,
+        goal_allocated_paise=allocated,
+        available_to_spend_paise=available,
     )
 
 
@@ -90,9 +117,11 @@ def update_account(
 ) -> AccountSnapshot:
     """Update permitted metadata, locking against concurrent transaction creation.
 
-    Opening-balance fields are editable only until the first transaction has
-    ever been inserted for the account. Deleted transactions still count. Both
-    this operation and transaction creation lock the account row first.
+    Opening-balance fields are editable only until the first transaction or
+    goal-ledger entry has been inserted for the account. Deleted transactions
+    and compensated entries still count. This operation, transaction creation,
+    and goal allocation mutations lock the account row before relying on its
+    balance.
     """
 
     if not changes:
@@ -132,7 +161,15 @@ def update_account(
             )
             .limit(1)
         )
-        if has_transaction is not None:
+        has_goal_entry = db.scalar(
+            select(GoalEntry.id)
+            .where(
+                GoalEntry.user_id == user_id,
+                GoalEntry.account_id == account.id,
+            )
+            .limit(1)
+        )
+        if has_transaction is not None or has_goal_entry is not None:
             raise AccountOpeningBalanceLockedError
 
         if "opening_balance_paise" in changes:
@@ -162,36 +199,94 @@ def update_account(
 
 
 def _account_balance_query(
-    db: Session, *, user_id: UUID, as_of: date, account_id: UUID | None = None
-) -> list[tuple[Account, int]]:
-    net_amount = func.coalesce(
+    db: Session,
+    *,
+    user_id: UUID,
+    as_of: date,
+    account_id: UUID | None = None,
+    include_archived: bool = False,
+) -> list[tuple[Account, int, int, int]]:
+    """Read account metadata and its complete financial snapshot in one statement.
+
+    Grouped subqueries are joined to the account rows so PostgreSQL evaluates
+    balance, allocations, and available-to-spend from one READ COMMITTED
+    statement snapshot. This avoids mixing commits between separate aggregates.
+    """
+
+    transaction_net = (
+        select(
+            Transaction.user_id.label("user_id"),
+            Transaction.account_id.label("account_id"),
+            func.sum(
+                case(
+                    (Transaction.transaction_type == "income", Transaction.amount_paise),
+                    else_=-Transaction.amount_paise,
+                )
+            ).label("net_paise"),
+        )
+        .join(
+            Account,
+            (Account.user_id == Transaction.user_id)
+            & (Account.id == Transaction.account_id),
+        )
+        .where(
+            Transaction.user_id == user_id,
+            Transaction.deleted_at.is_(None),
+            Transaction.transaction_date >= Account.opening_balance_as_of,
+            Transaction.transaction_date <= as_of,
+        )
+    )
+    allocation_net = select(
+        GoalEntry.user_id.label("user_id"),
+        GoalEntry.account_id.label("account_id"),
         func.sum(
             case(
-                (Transaction.transaction_type == "income", Transaction.amount_paise),
-                else_=-Transaction.amount_paise,
+                (GoalEntry.entry_type == "contribution", GoalEntry.amount_paise),
+                else_=-GoalEntry.amount_paise,
             )
-        ),
-        0,
+        ).label("net_paise"),
+    ).where(
+        GoalEntry.user_id == user_id,
+        GoalEntry.effective_date <= as_of,
     )
+    if account_id is not None:
+        transaction_net = transaction_net.where(Transaction.account_id == account_id)
+        allocation_net = allocation_net.where(GoalEntry.account_id == account_id)
+    transaction_net = transaction_net.group_by(
+        Transaction.user_id, Transaction.account_id
+    ).subquery("transaction_net")
+    allocation_net = allocation_net.group_by(
+        GoalEntry.user_id, GoalEntry.account_id
+    ).subquery("allocation_net")
+
+    actual_balance = (
+        Account.opening_balance_paise
+        + func.coalesce(transaction_net.c.net_paise, 0)
+    )
+    allocated = func.coalesce(allocation_net.c.net_paise, 0)
+    available = actual_balance - allocated
     stmt = (
-        select(Account, net_amount)
+        select(Account, actual_balance, allocated, available)
         .outerjoin(
-            Transaction,
-            (Transaction.user_id == Account.user_id)
-            & (Transaction.account_id == Account.id)
-            & (Transaction.deleted_at.is_(None))
-            & (Transaction.transaction_date >= Account.opening_balance_as_of)
-            & (Transaction.transaction_date <= as_of),
+            transaction_net,
+            (transaction_net.c.user_id == Account.user_id)
+            & (transaction_net.c.account_id == Account.id),
         )
-        .where(Account.user_id == user_id, Account.archived_at.is_(None))
-        .group_by(Account.id)
+        .outerjoin(
+            allocation_net,
+            (allocation_net.c.user_id == Account.user_id)
+            & (allocation_net.c.account_id == Account.id),
+        )
+        .where(Account.user_id == user_id)
         .order_by(Account.is_default.desc(), Account.created_at, Account.id)
     )
     if account_id is not None:
         stmt = stmt.where(Account.id == account_id)
+    if not include_archived:
+        stmt = stmt.where(Account.archived_at.is_(None))
 
     rows = db.execute(stmt).all()
-    result: list[tuple[Account, int]] = []
-    for account, net in rows:
-        result.append((account, account.opening_balance_paise + int(net)))
-    return result
+    return [
+        (account, int(balance), int(goal_allocated), int(available_to_spend))
+        for account, balance, goal_allocated, available_to_spend in rows
+    ]

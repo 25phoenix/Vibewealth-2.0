@@ -15,6 +15,7 @@ from sqlalchemy import (
     Index,
     PrimaryKeyConstraint,
     String,
+    Text,
     UniqueConstraint,
     func,
     text,
@@ -54,6 +55,7 @@ class SavingsGoal(Base):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
     target_paise: Mapped[int] = mapped_column(BigInteger, nullable=False)
     target_date: Mapped[date | None] = mapped_column(Date)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

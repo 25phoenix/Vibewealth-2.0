@@ -38,6 +38,8 @@ class AccountResponse(BaseModel):
     opening_balance_paise: int
     opening_balance_as_of: date
     balance_paise: int
+    goal_allocated_paise: int
+    available_to_spend_paise: int
     created_at: datetime
     updated_at: datetime
 
@@ -45,4 +47,6 @@ class AccountResponse(BaseModel):
 class AccountBalanceResponse(BaseModel):
     account_id: UUID
     balance_paise: int
+    goal_allocated_paise: int
+    available_to_spend_paise: int
     as_of: date

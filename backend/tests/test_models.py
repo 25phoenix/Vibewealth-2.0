@@ -184,6 +184,14 @@ def test_check_constraints_and_partial_unique_indexes_are_named() -> None:
     assert "ck_transactions_amount_positive" in _constraints(Transaction, CheckConstraint)
     assert "ck_budgets_month_start_first_day" in _constraints(Budget, CheckConstraint)
     assert "ck_goal_entries_amount_positive" in _constraints(GoalEntry, CheckConstraint)
+    assert SavingsGoal.__table__.c.description.nullable is True
+    goal_entry_index = _indexes(GoalEntry)["ix_goal_entries_user_goal_created"]
+    assert tuple(column.name for column in goal_entry_index.columns) == (
+        "user_id",
+        "goal_id",
+        "created_at",
+        "id",
+    )
     assert "ck_assistant_messages_sequence_positive" in _constraints(AssistantMessage, CheckConstraint)
     assert "ck_assistant_messages_content_nonempty" in _constraints(AssistantMessage, CheckConstraint)
 

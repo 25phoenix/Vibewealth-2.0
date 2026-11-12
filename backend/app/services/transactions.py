@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from app.core.financial import MAX_SAFE_PAISE, financial_today
 from app.models import Account, Category, Transaction
+from app.services.accounts import get_account_balance
 
 
 class AccountNotFoundError(LookupError):
@@ -97,6 +98,20 @@ def create_transaction(
         )
 
     balance_delta = amount_paise if transaction_type == "income" else -amount_paise
+    if balance_delta < 0:
+        current_account = get_account_balance(
+            db,
+            user_id=user_id,
+            account_id=account.id,
+            as_of=today,
+        )
+        if (
+            current_account.balance_paise + balance_delta
+            < current_account.goal_allocated_paise
+        ):
+            raise InvalidTransactionError(
+                "Transaction would make available-to-spend negative or spend money allocated to a savings goal"
+            )
     _validate_daily_balance_range(
         db,
         account=account,

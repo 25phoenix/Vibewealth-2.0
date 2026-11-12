@@ -40,6 +40,8 @@ def _account_response(snapshot: AccountSnapshot) -> AccountResponse:
         opening_balance_paise=account.opening_balance_paise,
         opening_balance_as_of=account.opening_balance_as_of,
         balance_paise=snapshot.balance_paise,
+        goal_allocated_paise=snapshot.goal_allocated_paise,
+        available_to_spend_paise=snapshot.available_to_spend_paise,
         created_at=account.created_at,
         updated_at=account.updated_at,
     )
@@ -134,6 +136,8 @@ def account_balance(
     return AccountBalanceResponse(
         account_id=snapshot.account.id,
         balance_paise=snapshot.balance_paise,
+        goal_allocated_paise=snapshot.goal_allocated_paise,
+        available_to_spend_paise=snapshot.available_to_spend_paise,
         as_of=snapshot.as_of,
     )
 
@@ -166,7 +170,7 @@ def patch_account(
         raise _rollback_error(
             db,
             code=409,
-            message="Opening balance cannot change after a transaction has been created",
+            message="Opening balance cannot change after a transaction or goal entry has been created",
         ) from None
     except InvalidAccountUpdateError as error:
         raise _rollback_error(db, code=422, message=str(error)) from None

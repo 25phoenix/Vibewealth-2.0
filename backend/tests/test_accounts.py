@@ -40,7 +40,7 @@ def test_opening_balance_service_rejects_non_integer_or_unsafe_paise(invalid_val
         opening_balance_as_of=date(2026, 1, 1),
         archived_at=None,
     )
-    db.scalar.side_effect = [account, None]
+    db.scalar.side_effect = [account, None, None]
 
     with pytest.raises(InvalidAccountUpdateError, match="safe integer"):
         update_account(

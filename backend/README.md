@@ -6,13 +6,13 @@ categories, transactions, budgets, savings goals and entries, assistant
 conversations and messages, and authentication sessions. It provides health
 endpoints and cookie-based registration, login, current-user, CSRF-token, and
 logout endpoints. Authentication uses Argon2id password hashes and
-PostgreSQL-backed opaque sessions. Full financial CRUD, a persistent assistant
-service, and live AI integration are not implemented. Schema changes are
-managed explicitly with Alembic.
+PostgreSQL-backed opaque sessions. Transaction editing/import APIs, a
+persistent assistant service, and live AI integration are not implemented.
+Schema changes are managed explicitly with Alembic.
 
-This backend is not a declaration of public launch readiness. Budget and
-savings-goal APIs, account recovery, production deployment configuration, and a
-broader security review remain separate work.
+This backend is not a declaration of public launch readiness. Account recovery,
+production deployment configuration, and a broader security review remain
+separate work.
 
 ## Requirements
 
@@ -127,6 +127,19 @@ reachable. Current endpoints are:
 | `POST` | `/api/transactions` | Creates an income or expense transaction; requires CSRF protection |
 | `GET` | `/api/transactions` | Lists live transactions with filters and pagination |
 | `GET` | `/api/transactions/{transaction_id}` | Retrieves one owned live transaction |
+| `GET` | `/api/budgets?month_start=YYYY-MM-01` | Lists owned budgets and actual spending; month filter is optional |
+| `GET` | `/api/budgets/{budget_id}` | Retrieves one owned budget and its actual spending |
+| `POST` | `/api/budgets` | Creates an overall or active expense-category budget; requires CSRF protection |
+| `PATCH` | `/api/budgets/{budget_id}` | Updates an owned budget; requires CSRF protection |
+| `DELETE` | `/api/budgets/{budget_id}` | Deletes an owned budget; requires CSRF protection |
+| `GET` | `/api/goals?offset=0&limit=50` | Lists active owned savings goals and allocation summaries |
+| `GET` | `/api/goals/{goal_id}` | Retrieves one active owned goal and per-account allocations |
+| `POST` | `/api/goals` | Creates a goal; requires CSRF protection |
+| `PATCH` | `/api/goals/{goal_id}` | Updates permitted goal metadata; requires CSRF protection |
+| `DELETE` | `/api/goals/{goal_id}` | Releases allocations and soft-deletes the goal; requires CSRF protection |
+| `GET` | `/api/goals/{goal_id}/entries?offset=0&limit=50` | Lists append-only goal ledger history |
+| `POST` | `/api/goals/{goal_id}/contributions` | Allocates available account money to a goal; requires CSRF protection |
+| `POST` | `/api/goals/{goal_id}/withdrawals` | Releases an allocation from the same goal/account pair; requires CSRF protection |
 
 Account and transaction reads require a valid session. Category reads also
 require a valid session; category listing excludes archived categories and
@@ -163,9 +176,12 @@ Account updates and transaction creation acquire the account row lock first, so
 concurrent writes serialize around that invariant. Services stage database
 changes without committing; the HTTP request owns commit and rollback.
 
-The account balance is not available-to-spend. Goal allocations do not yet have
-an API and are not included in this balance; available-to-spend will be defined
-with the later savings-goal phase.
+Account responses include the actual `balance_paise`, net
+`goal_allocated_paise`, and `available_to_spend_paise`. The actual balance is
+opening balance plus live income minus live expenses; goal entries never change
+it. Available-to-spend is actual account balance minus the net allocations in
+that account. Historical balance responses include allocations effective on or
+before the requested India-calendar date.
 
 Transaction listing supports `account_id`, `transaction_type`, `category_id`,
 `date_from`, `date_to`, `offset`, and `limit` query parameters. Results exclude
@@ -218,9 +234,97 @@ Missing or invalid sessions return 401; an authenticated request with an
 untrusted origin or missing/invalid CSRF header returns 403.
 
 CORS allows only the exact configured frontend origins, credentials, `GET`,
-`POST`, and `PATCH`, and the `Content-Type` and `X-CSRF-Token` headers. CORS is
-a browser policy; the server independently checks Origin/Referer on registration/login
-and Origin plus CSRF on logout.
+`POST`, `PATCH`, and `DELETE`, and the `Content-Type` and `X-CSRF-Token`
+headers. CORS is a browser policy; the server independently checks
+Origin/Referer on registration/login and Origin plus CSRF on state-changing
+authenticated requests.
+
+## Budget API
+
+Authenticated users can list, retrieve, create, update, and delete monthly
+budgets at `/api/budgets`. Write requests require the session CSRF token.
+Budgets are either overall (`category_id: null`) or for an active expense
+category owned by the user. Limits are positive integer paise no greater than
+the JavaScript safe-integer maximum. `month_start` must be the first day of its
+month. PostgreSQL partial unique indexes enforce one overall budget per user
+and month and one budget per user, category, and month; duplicates return HTTP
+409.
+
+Each response includes actual expense spending, remaining paise, and
+`percent_used_basis_points` (one percentage point is 100 basis points; 10,000
+means 100%). Percentages use integer arithmetic rounded half-up. Actual
+spending includes non-deleted expense transactions dated in the calendar month
+`[month_start, first day of next month)`. Income and goal allocations are
+excluded. Overall budgets include categorized and uncategorized expenses;
+category budgets include only that category. Remaining amounts may be
+negative when spending exceeds the limit. Calculations use grouped database
+queries and do not issue a query per budget.
+
+For precision, `limit_paise` is returned as a JSON integer because request
+validation bounds it to JavaScript's safe-integer range. The response fields
+`actual_spending_paise`, `remaining_paise`, and `percent_used_basis_points` are
+base-10 decimal strings. The backend retains exact integer arithmetic for all
+calculations and converts these values to strings only when building the API
+response. Frontend exact arithmetic must parse these strings as `BigInt`; do not
+convert them to `Number`. A chart may convert a separately scaled ratio to a
+number for display.
+
+Services stage changes without committing. The HTTP request boundary commits
+successful mutations and rolls back validation, uniqueness, or database
+failures. Archived categories remain valid on existing budgets and are still
+included in their historical spending; they cannot be selected for a new
+budget or newly assigned by an update.
+
+## Savings goals and allocation ledger
+
+Goals are tenant-scoped and soft-deleted. Create and update requests support a
+name, optional description, positive target in integer paise no greater than
+the JavaScript safe-integer maximum, and optional target date. Past target dates
+are rejected using the product's `Asia/Kolkata` financial date convention.
+Updating a target below the amount currently allocated to that goal returns
+HTTP 409. Deleted and foreign goals are both reported as not found. Repeating a
+delete also returns 404.
+
+Contributions and withdrawals are append-only `goal_entries`; the API has no
+entry update or delete operation. Entries receive their effective date from
+the server. A contribution records a virtual allocation from one owned active
+account to one active goal. A withdrawal releases only the outstanding amount
+for that exact goal/account pair. Both use positive safe-integer paise and
+return updated goal and account summaries. They do not create transactions or
+change actual account balances.
+
+The allocation ledger derives the current net as contributions minus
+withdrawals. An account's available-to-spend amount is its actual balance minus
+all net goal allocations in that account. Contributions are rejected when they
+exceed that available amount or would make the goal's aggregate exceed
+`Number.MAX_SAFE_INTEGER` paise. Expenses are rejected if the resulting
+available-to-spend would be negative, including when allocations are zero.
+Income remains allowed and increases actual balance. Opening-balance edits are
+locked after any transaction or goal entry has been recorded for the account.
+Account balance, allocation, and available-to-spend values are calculated in a
+single SQL statement snapshot.
+
+Contributions are not currently capped at the goal target. The API can return a
+negative `remaining_target_paise` after overfunding; whether to reject
+overfunding remains a product decision.
+
+Contributions and withdrawals lock the goal first, then the account. Expense
+and income creation and opening-balance updates lock the account; transaction
+creation then takes a shared lock on the selected category. Goal deletion locks
+the goal, computes outstanding allocations grouped by account, locks affected
+accounts in ascending UUID order, appends one compensating withdrawal per
+positive account allocation, and soft-deletes the goal in the same request
+transaction. Services do not commit. A request failure rolls back entries and
+deletion together. Original ledger entries are never edited or deleted. Goal
+deletion releases the reservation without changing actual account balances.
+
+Goal lists and ledger histories are paginated with `offset` and `limit` (1–100)
+and use deterministic ordering. Aggregations are grouped in SQL rather than
+queried once per goal or account.
+
+Budget aggregate responses use decimal strings for exact client transport;
+`limit_paise` remains a safe-range JSON integer. Budget-list pagination remains
+deferred.
 
 ## Run tests
 
@@ -306,8 +410,9 @@ Before any command that connects to PostgreSQL, verify the effective database
 target. `alembic upgrade` changes that database's schema; do not point it at a
 database whose schema is not intended to be migrated.
 
-The current migration head is `e7a30067c81c` (`add authentication sessions`)
-and includes the approved initial schema plus authentication sessions. Create a
+The current migration head is `6b9c2f1d4a80` (`add goal descriptions and goal-scoped ledger index`)
+and includes the approved initial schema, authentication sessions, and the goal
+description/history-index changes. Create a
 migration only after adding or changing ORM models:
 
 ```sh

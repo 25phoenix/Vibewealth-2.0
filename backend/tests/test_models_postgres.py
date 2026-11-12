@@ -11,8 +11,8 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, func, select, text, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import create_engine, event, func, select, text, update
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -44,8 +44,24 @@ from app.services.authentication import AuthenticationError, get_current_user, l
 from app.services import registration
 from app.services.registration import DuplicateEmailError, register_user
 from app.core.financial import financial_today
-from app.services.accounts import AccountOpeningBalanceLockedError, update_account
-from app.services.transactions import create_transaction
+from app.core.financial import MAX_SAFE_PAISE
+from app.services.accounts import (
+    AccountOpeningBalanceLockedError,
+    get_account,
+    update_account,
+)
+from app.services.budgets import DuplicateBudgetError, create_budget
+from app.services.goals import (
+    ExcessiveGoalWithdrawalError,
+    GoalAllocationLimitExceededError,
+    GoalNotFoundError,
+    InsufficientAvailableToSpendError,
+    create_goal,
+    create_goal_entry,
+    delete_goal,
+    get_goal,
+)
+from app.services.transactions import InvalidTransactionError, create_transaction
 
 
 @pytest.fixture
@@ -1605,10 +1621,14 @@ def test_http_account_and_transaction_balances_filters_and_soft_deletes(auth_htt
     balance_current = client.get(f"/api/accounts/{account.id}/balance")
     assert current.status_code == detail.status_code == 200
     assert current.json()[0]["balance_paise"] == 6500
+    assert current.json()[0]["goal_allocated_paise"] == 0
+    assert current.json()[0]["available_to_spend_paise"] == 6500
     assert detail.json()["balance_paise"] == 6500
     assert balance_at_open.json() == {
         "account_id": str(account.id),
         "balance_paise": 7500,
+        "goal_allocated_paise": 0,
+        "available_to_spend_paise": 7500,
         "as_of": opening_date.isoformat(),
     }
     assert balance_current.json()["balance_paise"] == 6500
@@ -1765,10 +1785,9 @@ def test_historical_daily_balances_stay_within_javascript_safe_integer(auth_http
             },
         )
 
-    # The positive and negative limits are both valid daily closing balances.
+    # Reaching the safe limit on separate historical days remains valid.
     assert post(income_category.id, "income", maximum, day_one).status_code == 201
     assert post(expense_category.id, "expense", maximum, day_two).status_code == 201
-    assert post(expense_category.id, "expense", maximum, today).status_code == 201
 
     day_one_balance = client.get(
         f"/api/accounts/{account.id}/balance?as_of={day_one.isoformat()}"
@@ -1779,7 +1798,7 @@ def test_historical_daily_balances_stay_within_javascript_safe_integer(auth_http
     today_balance = client.get(f"/api/accounts/{account.id}/balance")
     assert day_one_balance.json()["balance_paise"] == maximum
     assert day_two_balance.json()["balance_paise"] == 0
-    assert today_balance.json()["balance_paise"] == -maximum
+    assert today_balance.json()["balance_paise"] == 0
 
     # This backdated income would make day one 2 * maximum while leaving the
     # current balance at zero. It must be rejected based on the intermediate day.
@@ -1789,10 +1808,11 @@ def test_historical_daily_balances_stay_within_javascript_safe_integer(auth_http
     assert intermediate_overflow.status_code == 422
     assert "daily account balance" in intermediate_overflow.json()["detail"]
 
-    # Each inclusive boundary is checked independently, including one paise over.
+    # The upper safe-integer boundary is checked independently, including one
+    # paise over. The expense floor rejects spending from a zero balance.
     positive_overflow = post(income_category.id, "income", 1, day_one)
-    negative_overflow = post(expense_category.id, "expense", 1, today)
-    assert positive_overflow.status_code == negative_overflow.status_code == 422
+    expense_below_zero = post(expense_category.id, "expense", 1, today)
+    assert positive_overflow.status_code == expense_below_zero.status_code == 422
 
     # Rejected writes are rolled back at the HTTP boundary, and the session can
     # still query the database and return the original historical balances.
@@ -1800,7 +1820,7 @@ def test_historical_daily_balances_stay_within_javascript_safe_integer(auth_http
         select(func.count()).select_from(Transaction).where(
             Transaction.user_id == user.id
         )
-    ) == 3
+    ) == 2
     final_balances = [
         day_one_balance.json()["balance_paise"],
         day_two_balance.json()["balance_paise"],
@@ -2025,3 +2045,1403 @@ def test_concurrent_opening_balance_edit_and_transaction_creation_are_serialized
     assert session.scalar(
         select(func.count()).select_from(Transaction).where(Transaction.account_id == account.id)
     ) == 1
+
+
+def _previous_month_start(value: date) -> date:
+    this_month = value.replace(day=1)
+    previous_month_day = this_month - timedelta(days=1)
+    return previous_month_day.replace(day=1)
+
+
+def test_http_budgets_calculate_spending_and_enforce_tenant_rules(auth_http_client):
+    client, settings, session = auth_http_client
+    user_a, account_a, food = _make_financial_user(session)
+    user_b, account_b, foreign_category = _make_financial_user(session)
+    transport = Category(
+        user_id=user_a.id, name="Transport", transaction_type="expense"
+    )
+    salary = Category(user_id=user_a.id, name="Salary", transaction_type="income")
+    archived = Category(
+        user_id=user_a.id,
+        name="Archived",
+        transaction_type="expense",
+        archived_at=datetime.now(timezone.utc),
+    )
+    session.add_all([transport, salary, archived])
+    session.flush()
+
+    current_month = financial_today().replace(day=1)
+    month_start = _previous_month_start(financial_today())
+    next_month = current_month
+    previous_day = month_start - timedelta(days=1)
+    last_day = next_month - timedelta(days=1)
+    mid_month = month_start.replace(day=15)
+    transaction_rows = [
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=food.id,
+            transaction_type="expense",
+            amount_paise=1000,
+            description="First day expense",
+            transaction_date=month_start,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=food.id,
+            transaction_type="expense",
+            amount_paise=2000,
+            description="Last day expense",
+            transaction_date=last_day,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=transport.id,
+            transaction_type="expense",
+            amount_paise=3000,
+            description="Transport expense",
+            transaction_date=mid_month,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=salary.id,
+            transaction_type="income",
+            amount_paise=9000,
+            description="Income excluded",
+            transaction_date=mid_month,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=food.id,
+            transaction_type="expense",
+            amount_paise=6000,
+            description="Before month",
+            transaction_date=previous_day,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=food.id,
+            transaction_type="expense",
+            amount_paise=7000,
+            description="First day after month",
+            transaction_date=next_month,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=food.id,
+            transaction_type="expense",
+            amount_paise=5000,
+            description="Deleted expense excluded",
+            transaction_date=mid_month,
+            deleted_at=datetime.now(timezone.utc),
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=None,
+            transaction_type="expense",
+            amount_paise=500,
+            description="Uncategorized import included overall",
+            transaction_date=mid_month,
+        ),
+        Transaction(
+            user_id=user_b.id,
+            account_id=account_b.id,
+            category_id=foreign_category.id,
+            transaction_type="expense",
+            amount_paise=8000,
+            description="Other tenant excluded",
+            transaction_date=mid_month,
+        ),
+    ]
+    session.add_all(transaction_rows)
+    session.commit()
+    headers_a = _authenticated_finance_headers(client, settings, session, user_a)
+
+    def create(month, amount, category_id=None):
+        return client.post(
+            "/api/budgets",
+            headers=headers_a,
+            json={
+                "month_start": month.isoformat(),
+                "category_id": str(category_id) if category_id else None,
+                "limit_paise": amount,
+            },
+        )
+
+    overall = create(month_start, 5000)
+    food_budget = create(month_start, 3000, food.id)
+    transport_budget = create(month_start, 1000, transport.id)
+    empty_month = _previous_month_start(_previous_month_start(month_start))
+    empty_budget = create(empty_month, 800)
+    assert overall.status_code == food_budget.status_code == transport_budget.status_code == 201
+    assert empty_budget.status_code == 201
+
+    assert create(month_start, 4000).status_code == 409
+    assert create(month_start, 4000, food.id).status_code == 409
+    assert create(month_start, 1000, salary.id).status_code == 422
+    assert create(month_start, 1000, foreign_category.id).status_code == 422
+    assert create(month_start, 1000, archived.id).status_code == 422
+
+    filtered = client.get(
+        "/api/budgets",
+        headers=headers_a,
+        params={"month_start": month_start.isoformat()},
+    )
+    assert filtered.status_code == 200
+    assert filtered.headers["cache-control"] == "no-store"
+    entries = {entry["id"]: entry for entry in filtered.json()}
+    assert entries[overall.json()["id"]]["actual_spending_paise"] == "6500"
+    assert entries[overall.json()["id"]]["remaining_paise"] == "-1500"
+    assert entries[overall.json()["id"]]["percent_used_basis_points"] == "13000"
+    assert entries[overall.json()["id"]]["limit_paise"] == 5000
+    assert entries[food_budget.json()["id"]]["actual_spending_paise"] == "3000"
+    assert entries[food_budget.json()["id"]]["remaining_paise"] == "0"
+    assert entries[food_budget.json()["id"]]["percent_used_basis_points"] == "10000"
+    assert entries[transport_budget.json()["id"]]["actual_spending_paise"] == "3000"
+    assert entries[transport_budget.json()["id"]]["remaining_paise"] == "-2000"
+    assert entries[transport_budget.json()["id"]]["percent_used_basis_points"] == "30000"
+
+    category_update = client.patch(
+        f"/api/budgets/{empty_budget.json()['id']}",
+        headers=headers_a,
+        json={"category_id": str(transport.id)},
+    )
+    assert category_update.status_code == 200
+    duplicate_update = client.patch(
+        f"/api/budgets/{empty_budget.json()['id']}",
+        headers=headers_a,
+        json={"month_start": month_start.isoformat()},
+    )
+    assert duplicate_update.status_code == 409
+
+    empty = client.get(f"/api/budgets/{empty_budget.json()['id']}", headers=headers_a)
+    assert empty.status_code == 200
+    assert empty.json()["actual_spending_paise"] == "0"
+    assert empty.json()["remaining_paise"] == "800"
+    assert empty.json()["percent_used_basis_points"] == "0"
+
+    # Archived categories remain valid on historical budgets and their spending.
+    food.archived_at = datetime.now(timezone.utc)
+    session.commit()
+    historical_food_budget = client.get(
+        f"/api/budgets/{food_budget.json()['id']}", headers=headers_a
+    )
+    assert historical_food_budget.status_code == 200
+    assert historical_food_budget.json()["category_name"] == "Food"
+    assert historical_food_budget.json()["actual_spending_paise"] == "3000"
+    changed = client.patch(
+        f"/api/budgets/{food_budget.json()['id']}",
+        headers=headers_a,
+        json={"limit_paise": 3500},
+    )
+    assert changed.status_code == 200
+    assert changed.json()["remaining_paise"] == "500"
+
+    cannot_select_archived = client.patch(
+        f"/api/budgets/{overall.json()['id']}",
+        headers=headers_a,
+        json={"category_id": str(food.id)},
+    )
+    assert cannot_select_archived.status_code == 422
+
+    headers_b = _authenticated_finance_headers(client, settings, session, user_b)
+    foreign_read = client.get(f"/api/budgets/{overall.json()['id']}", headers=headers_b)
+    foreign_update = client.patch(
+        f"/api/budgets/{overall.json()['id']}",
+        headers=headers_b,
+        json={"limit_paise": 9000},
+    )
+    foreign_delete = client.delete(
+        f"/api/budgets/{overall.json()['id']}", headers=headers_b
+    )
+    assert foreign_read.status_code == foreign_update.status_code == 404
+    assert foreign_delete.status_code == 404
+
+    headers_a = _authenticated_finance_headers(client, settings, session, user_a)
+    deleted = client.delete(
+        f"/api/budgets/{transport_budget.json()['id']}", headers=headers_a
+    )
+    assert deleted.status_code == 204
+    assert client.get(
+        f"/api/budgets/{transport_budget.json()['id']}", headers=headers_a
+    ).status_code == 404
+
+
+def test_budget_aggregate_precision_contract_for_list_retrieve_and_openapi(
+    auth_http_client,
+):
+    client, settings, session = auth_http_client
+    user, account_a, expense_category = _make_financial_user(session)
+    account_a.opening_balance_paise = MAX_SAFE_PAISE
+    account_b = _add_account(
+        session,
+        user,
+        name="Large aggregate account",
+        opening_paise=MAX_SAFE_PAISE,
+    )
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    month_start = financial_today().replace(day=1)
+
+    for account in (account_a, account_b):
+        transaction = client.post(
+            "/api/transactions",
+            headers=headers,
+            json={
+                "account_id": str(account.id),
+                "category_id": str(expense_category.id),
+                "transaction_type": "expense",
+                "amount_paise": MAX_SAFE_PAISE,
+                "description": "Safe per-account maximum",
+                "transaction_date": financial_today().isoformat(),
+            },
+        )
+        assert transaction.status_code == 201
+
+    created = client.post(
+        "/api/budgets",
+        headers=headers,
+        json={
+            "month_start": month_start.isoformat(),
+            "category_id": None,
+            "limit_paise": 1,
+        },
+    )
+    assert created.status_code == 201
+    budget_id = created.json()["id"]
+
+    listed = client.get("/api/budgets", headers=headers)
+    retrieved = client.get(f"/api/budgets/{budget_id}", headers=headers)
+    assert listed.status_code == retrieved.status_code == 200
+    list_item = next(item for item in listed.json() if item["id"] == budget_id)
+    detail = retrieved.json()
+
+    expected_fields = {
+        "limit_paise": 1,
+        "actual_spending_paise": "18014398509481982",
+        "remaining_paise": "-18014398509481981",
+        "percent_used_basis_points": "180143985094819820000",
+    }
+    for response in (created.json(), list_item, detail):
+        assert {key: response[key] for key in expected_fields} == expected_fields
+        assert type(response["limit_paise"]) is int
+        assert all(
+            type(response[field]) is str
+            for field in (
+                "actual_spending_paise",
+                "remaining_paise",
+                "percent_used_basis_points",
+            )
+        )
+
+    openapi = client.get("/openapi.json")
+    assert openapi.status_code == 200
+    properties = openapi.json()["components"]["schemas"]["BudgetResponse"]["properties"]
+    assert properties["limit_paise"]["type"] == "integer"
+    for field in (
+        "actual_spending_paise",
+        "remaining_paise",
+        "percent_used_basis_points",
+    ):
+        assert properties[field]["type"] == "string"
+
+
+def test_budget_service_does_not_commit_and_rollback_removes_record(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, _, _ = _make_financial_user(session)
+    session.commit()
+
+    created = create_budget(
+        session,
+        user_id=user.id,
+        month_start=date(2026, 2, 1),
+        category_id=None,
+        limit_paise=1000,
+    )
+
+    assert session.in_transaction()
+    assert created.budget.user_id == user.id
+    session.rollback()
+    assert session.scalar(
+        select(Budget.id).where(Budget.user_id == user.id)
+    ) is None
+
+
+def test_concurrent_duplicate_budget_creation_uses_database_uniqueness(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, _, _ = _make_financial_user(session)
+    session.commit()
+    barrier = Barrier(2)
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+
+    def create_concurrently():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                created = create_budget(
+                    worker,
+                    user_id=user.id,
+                    month_start=date(2026, 3, 1),
+                    category_id=None,
+                    limit_paise=1000,
+                )
+                worker.commit()
+                return created.budget.id
+            except DuplicateBudgetError:
+                worker.rollback()
+                return "duplicate"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: create_concurrently(), range(2)))
+
+    assert outcomes.count("duplicate") == 1
+    assert len([value for value in outcomes if value != "duplicate"]) == 1
+    assert session.scalar(
+        select(func.count()).select_from(Budget).where(
+            Budget.user_id == user.id,
+            Budget.month_start == date(2026, 3, 1),
+            Budget.category_id.is_(None),
+        )
+    ) == 1
+
+
+def _make_goal(session: Session, user: User, *, name: str, target_paise: int = 50_000):
+    return create_goal(
+        session,
+        user_id=user.id,
+        name=name,
+        description=None,
+        target_paise=target_paise,
+        target_date=None,
+    ).goal
+
+
+def _add_account(session: Session, user: User, *, name: str, opening_paise: int) -> Account:
+    account = Account(
+        user_id=user.id,
+        name=name,
+        account_type="bank",
+        is_default=False,
+        opening_balance_paise=opening_paise,
+        opening_balance_as_of=date(2026, 1, 1),
+    )
+    session.add(account)
+    session.flush()
+    return account
+
+
+def test_expenses_never_reduce_available_to_spend_below_zero(auth_http_client):
+    client, settings, session = auth_http_client
+    user, account, expense_category = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    other_account = _add_account(
+        session, user, name="Separate funds", opening_paise=5_000
+    )
+    income_category = Category(
+        user_id=user.id, name="Pay", transaction_type="income"
+    )
+    session.add(income_category)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+
+    def post_transaction(account_id, category_id, transaction_type, amount):
+        return client.post(
+            "/api/transactions",
+            headers=headers,
+            json={
+                "account_id": str(account_id),
+                "category_id": str(category_id),
+                "transaction_type": transaction_type,
+                "amount_paise": amount,
+                "description": f"{transaction_type} boundary",
+                "transaction_date": financial_today().isoformat(),
+            },
+        )
+
+    # Ordinary overspending is rejected even with no allocation. Funds in a
+    # second account do not authorize spending from this account.
+    assert post_transaction(
+        account.id, expense_category.id, "expense", 1_001
+    ).status_code == 422
+
+    goal_response = client.post(
+        "/api/goals",
+        headers=headers,
+        json={"name": "Reserve", "target_paise": 1_000},
+    )
+    assert goal_response.status_code == 201
+    goal_id = UUID(goal_response.json()["id"])
+    contribution = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account.id), "amount_paise": 400},
+    )
+    assert contribution.status_code == 201
+
+    # Available is 600: 601 is rejected and an exact 600-paise expense is
+    # accepted, leaving every paise reserved by the goal.
+    assert post_transaction(
+        account.id, expense_category.id, "expense", 601
+    ).status_code == 422
+    exact_available = post_transaction(
+        account.id, expense_category.id, "expense", 600
+    )
+    assert exact_available.status_code == 201
+    assert post_transaction(
+        account.id, expense_category.id, "expense", 1
+    ).status_code == 422
+
+    # Income is permitted with allocations and increases available-to-spend.
+    income = post_transaction(
+        account.id, income_category.id, "income", 100
+    )
+    assert income.status_code == 201
+    assert post_transaction(
+        account.id, expense_category.id, "expense", 101
+    ).status_code == 422
+    assert post_transaction(
+        account.id, expense_category.id, "expense", 100
+    ).status_code == 201
+
+    account_snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert account_snapshot.balance_paise == 400
+    assert account_snapshot.goal_allocated_paise == 400
+    assert account_snapshot.available_to_spend_paise == 0
+    assert get_account(
+        session, user_id=user.id, account_id=other_account.id
+    ).available_to_spend_paise == 5_000
+
+
+def test_account_financial_snapshot_is_one_statement(postgres_model_session):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    goal = _make_goal(session, user, name="Snapshot goal")
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account.id,
+        amount_paise=300,
+        entry_type="contribution",
+    )
+    session.commit()
+
+    connection = session.connection()
+    statements = []
+
+    def capture_select(_connection, _cursor, statement, _parameters, _context, _many):
+        if statement.lstrip().lower().startswith("select"):
+            statements.append(statement)
+
+    event.listen(connection, "before_cursor_execute", capture_select)
+    try:
+        snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    finally:
+        event.remove(connection, "before_cursor_execute", capture_select)
+
+    assert len(statements) == 1
+    assert snapshot.balance_paise == 1_000
+    assert snapshot.goal_allocated_paise == 300
+    assert snapshot.available_to_spend_paise == 700
+
+
+def test_http_goal_overfunding_remains_allowed_and_reports_negative_remaining(
+    auth_http_client,
+):
+    client, settings, session = auth_http_client
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+
+    created = client.post(
+        "/api/goals",
+        headers=headers,
+        json={"name": "Target decision", "target_paise": 500},
+    )
+    assert created.status_code == 201
+    contribution = client.post(
+        f"/api/goals/{created.json()['id']}/contributions",
+        headers=headers,
+        json={"account_id": str(account.id), "amount_paise": 501},
+    )
+    assert contribution.status_code == 201
+    assert contribution.json()["goal"]["allocated_paise"] == 501
+    assert contribution.json()["goal"]["remaining_target_paise"] == -1
+
+
+def test_http_goal_crud_contributions_withdrawals_and_account_availability(auth_http_client):
+    client, settings, session = auth_http_client
+    user_a, account_a, food = _make_financial_user(session)
+    account_b = _add_account(session, user_a, name="Secondary", opening_paise=4_000)
+    account_c = _add_account(session, user_a, name="Opening lock", opening_paise=1_000)
+    account_d = _add_account(session, user_a, name="Unused", opening_paise=1_000)
+    income_category = Category(
+        user_id=user_a.id, name="Pay", transaction_type="income"
+    )
+    session.add(income_category)
+    user_b, account_foreign, _ = _make_financial_user(session)
+    account_foreign.opening_balance_paise = 5_000
+    session.commit()
+    headers_a = _authenticated_finance_headers(client, settings, session, user_a)
+
+    income = client.post(
+        "/api/transactions",
+        headers=headers_a,
+        json={
+            "account_id": str(account_a.id),
+            "category_id": str(income_category.id),
+            "transaction_type": "income",
+            "amount_paise": 10_000,
+            "description": "Initial funding",
+            "transaction_date": account_a.opening_balance_as_of.isoformat(),
+        },
+    )
+    assert income.status_code == 201
+
+    created = client.post(
+        "/api/goals",
+        headers=headers_a,
+        json={
+            "name": "Emergency fund",
+            "description": "Unexpected costs",
+            "target_paise": 12_000,
+            "target_date": (financial_today() + timedelta(days=60)).isoformat(),
+        },
+    )
+    assert created.status_code == 201
+    goal_id = created.json()["id"]
+    assert created.json()["allocated_paise"] == 0
+    assert created.json()["description"] == "Unexpected costs"
+
+    listed = client.get("/api/goals", headers=headers_a)
+    retrieved = client.get(f"/api/goals/{goal_id}", headers=headers_a)
+    assert listed.status_code == retrieved.status_code == 200
+    assert listed.json()["total"] == 1
+    assert retrieved.json()["id"] == goal_id
+
+    contribution_a = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers_a,
+        json={"account_id": str(account_a.id), "amount_paise": 6_000},
+    )
+    contribution_b = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers_a,
+        json={"account_id": str(account_b.id), "amount_paise": 2_000},
+    )
+    contribution_c = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers_a,
+        json={"account_id": str(account_c.id), "amount_paise": 100},
+    )
+    assert contribution_a.status_code == contribution_b.status_code == contribution_c.status_code == 201
+    assert contribution_a.json()["goal"]["allocated_paise"] == 6_000
+    assert contribution_a.json()["account"] == {
+        "account_id": str(account_a.id),
+        "balance_paise": 10_000,
+        "goal_allocated_paise": 6_000,
+        "available_to_spend_paise": 4_000,
+    }
+    assert contribution_b.json()["account"]["balance_paise"] == 4_000
+    assert contribution_b.json()["account"]["available_to_spend_paise"] == 2_000
+
+    too_much = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers_a,
+        json={"account_id": str(account_a.id), "amount_paise": 5_000},
+    )
+    foreign_account = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers_a,
+        json={"account_id": str(account_foreign.id), "amount_paise": 1},
+    )
+    unused_account_withdrawal = client.post(
+        f"/api/goals/{goal_id}/withdrawals",
+        headers=headers_a,
+        json={"account_id": str(account_d.id), "amount_paise": 1},
+    )
+    assert too_much.status_code == 409
+    assert foreign_account.status_code == 404
+    assert unused_account_withdrawal.status_code == 409
+
+    headers_b = _authenticated_finance_headers(client, settings, session, user_b)
+    foreign_history = client.get(
+        f"/api/goals/{goal_id}/entries", headers=headers_b
+    )
+    assert foreign_history.status_code == 404
+    foreign_account_summaries = client.get("/api/accounts", headers=headers_b)
+    assert foreign_account_summaries.status_code == 200
+    assert all(
+        item["goal_allocated_paise"] == 0
+        for item in foreign_account_summaries.json()
+    )
+    foreign_goal = client.post(
+        "/api/goals",
+        headers=headers_b,
+        json={"name": "Private goal", "target_paise": 1000},
+    )
+    assert foreign_goal.status_code == 201
+    headers_a = _authenticated_finance_headers(client, settings, session, user_a)
+    cross_goal = client.post(
+        f"/api/goals/{foreign_goal.json()['id']}/contributions",
+        headers=headers_a,
+        json={"account_id": str(account_a.id), "amount_paise": 1},
+    )
+    assert cross_goal.status_code == 404
+    assert client.get(f"/api/goals/{foreign_goal.json()['id']}", headers=headers_a).status_code == 404
+    foreign_update = client.patch(
+        f"/api/goals/{foreign_goal.json()['id']}",
+        headers=headers_a,
+        json={"name": "Intrusion"},
+    )
+    foreign_delete = client.delete(
+        f"/api/goals/{foreign_goal.json()['id']}", headers=headers_a
+    )
+    assert foreign_update.status_code == foreign_delete.status_code == 404
+
+    excessive_withdrawal = client.post(
+        f"/api/goals/{goal_id}/withdrawals",
+        headers=headers_a,
+        json={"account_id": str(account_b.id), "amount_paise": 2_001},
+    )
+    withdrawal = client.post(
+        f"/api/goals/{goal_id}/withdrawals",
+        headers=headers_a,
+        json={"account_id": str(account_a.id), "amount_paise": 1_500},
+    )
+    assert excessive_withdrawal.status_code == 409
+    assert withdrawal.status_code == 201
+    assert withdrawal.json()["goal"]["allocated_paise"] == 6_600
+    assert withdrawal.json()["account"]["balance_paise"] == 10_000
+    assert withdrawal.json()["account"]["available_to_spend_paise"] == 5_500
+
+    lower_target = client.patch(
+        f"/api/goals/{goal_id}",
+        headers=headers_a,
+        json={"target_paise": 6_000},
+    )
+    update = client.patch(
+        f"/api/goals/{goal_id}",
+        headers=headers_a,
+        json={"name": "Rainy day fund", "target_paise": 7_000},
+    )
+    assert lower_target.status_code == 409
+    assert update.status_code == 200
+    assert update.json()["name"] == "Rainy day fund"
+
+    history = client.get(f"/api/goals/{goal_id}/entries", headers=headers_a)
+    assert history.status_code == 200
+    assert history.json()["total"] == 4
+    assert {entry["entry_type"] for entry in history.json()["items"]} == {
+        "contribution",
+        "withdrawal",
+    }
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user_a.id
+        )
+    ) == 1
+    actual_account = client.get(f"/api/accounts/{account_a.id}", headers=headers_a)
+    assert actual_account.status_code == 200
+    assert actual_account.json()["balance_paise"] == 10_000
+    assert actual_account.json()["goal_allocated_paise"] == 4_500
+    assert actual_account.json()["available_to_spend_paise"] == 5_500
+
+    opening_edit = client.patch(
+        f"/api/accounts/{account_a.id}",
+        headers=headers_a,
+        json={"opening_balance_paise": 11_000},
+    )
+    assert opening_edit.status_code == 409
+    opening_edit_after_goal_entry = client.patch(
+        f"/api/accounts/{account_c.id}",
+        headers=headers_a,
+        json={"opening_balance_paise": 1_500},
+    )
+    assert opening_edit_after_goal_entry.status_code == 409
+
+    expense = client.post(
+        "/api/transactions",
+        headers=headers_a,
+        json={
+            "account_id": str(account_a.id),
+            "category_id": str(food.id),
+            "transaction_type": "expense",
+            "amount_paise": 6_000,
+            "description": "Would spend reserved funds",
+            "transaction_date": financial_today().isoformat(),
+        },
+    )
+    assert expense.status_code == 422
+
+
+def test_goal_delete_releases_each_account_and_preserves_append_only_history(auth_http_client):
+    client, settings, session = auth_http_client
+    user, account_a, _ = _make_financial_user(session)
+    account_a.opening_balance_paise = 5_000
+    account_b = _add_account(session, user, name="Secondary", opening_paise=3_000)
+    account_empty = _add_account(session, user, name="No allocation", opening_paise=500)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    created = client.post(
+        "/api/goals",
+        headers=headers,
+        json={"name": "Trip", "target_paise": 7_000},
+    )
+    goal_id = created.json()["id"]
+    first = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account_a.id), "amount_paise": 2_000},
+    )
+    second = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account_b.id), "amount_paise": 1_000},
+    )
+    empty_contribution = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account_empty.id), "amount_paise": 200},
+    )
+    assert first.status_code == second.status_code == empty_contribution.status_code == 201
+    first_entry_id = first.json()["entry"]["id"]
+    second_entry_id = second.json()["entry"]["id"]
+    empty_contribution_id = empty_contribution.json()["entry"]["id"]
+    partial_withdrawal = client.post(
+        f"/api/goals/{goal_id}/withdrawals",
+        headers=headers,
+        json={"account_id": str(account_a.id), "amount_paise": 500},
+    )
+    zeroing_withdrawal = client.post(
+        f"/api/goals/{goal_id}/withdrawals",
+        headers=headers,
+        json={"account_id": str(account_empty.id), "amount_paise": 200},
+    )
+    assert partial_withdrawal.status_code == zeroing_withdrawal.status_code == 201
+    partial_withdrawal_id = partial_withdrawal.json()["entry"]["id"]
+    zeroing_withdrawal_id = zeroing_withdrawal.json()["entry"]["id"]
+
+    deleted = client.delete(f"/api/goals/{goal_id}", headers=headers)
+    assert deleted.status_code == 204
+    assert client.get("/api/goals", headers=headers).json()["total"] == 0
+    assert client.get(f"/api/goals/{goal_id}", headers=headers).status_code == 404
+    assert client.get(f"/api/goals/{goal_id}/entries", headers=headers).status_code == 404
+    assert client.delete(f"/api/goals/{goal_id}", headers=headers).status_code == 404
+    rejected_after_delete = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account_a.id), "amount_paise": 1},
+    )
+    assert rejected_after_delete.status_code == 404
+
+    session.expire_all()
+    ledger = list(
+        session.scalars(
+            select(GoalEntry).where(
+                GoalEntry.user_id == user.id,
+                GoalEntry.goal_id == UUID(goal_id),
+            )
+        ).all()
+    )
+    assert len(ledger) == 7
+    original_entries = {str(entry.id): entry for entry in ledger}
+    assert original_entries[first_entry_id].entry_type == "contribution"
+    assert original_entries[first_entry_id].amount_paise == 2_000
+    assert original_entries[second_entry_id].entry_type == "contribution"
+    assert original_entries[second_entry_id].amount_paise == 1_000
+    assert original_entries[empty_contribution_id].amount_paise == 200
+    assert original_entries[partial_withdrawal_id].amount_paise == 500
+    assert original_entries[zeroing_withdrawal_id].amount_paise == 200
+    original_ids = {
+        first_entry_id,
+        second_entry_id,
+        empty_contribution_id,
+        partial_withdrawal_id,
+        zeroing_withdrawal_id,
+    }
+    compensations = [entry for entry in ledger if str(entry.id) not in original_ids]
+    assert len(compensations) == 2
+    assert {(entry.account_id, entry.amount_paise) for entry in compensations} == {
+        (account_a.id, 1_500),
+        (account_b.id, 1_000),
+    }
+    assert {
+        entry_id: (original_entries[entry_id].entry_type,
+                   original_entries[entry_id].amount_paise,
+                   original_entries[entry_id].account_id)
+        for entry_id in original_ids
+    } == {
+        first_entry_id: ("contribution", 2_000, account_a.id),
+        second_entry_id: ("contribution", 1_000, account_b.id),
+        empty_contribution_id: ("contribution", 200, account_empty.id),
+        partial_withdrawal_id: ("withdrawal", 500, account_a.id),
+        zeroing_withdrawal_id: ("withdrawal", 200, account_empty.id),
+    }
+    for account, expected_balance in ((account_a, 5_000), (account_b, 3_000)):
+        response = client.get(f"/api/accounts/{account.id}", headers=headers)
+        assert response.json()["balance_paise"] == expected_balance
+        assert response.json()["goal_allocated_paise"] == 0
+        assert response.json()["available_to_spend_paise"] == expected_balance
+    empty_summary = client.get(f"/api/accounts/{account_empty.id}", headers=headers)
+    assert empty_summary.json()["balance_paise"] == 500
+    assert empty_summary.json()["goal_allocated_paise"] == 0
+    assert empty_summary.json()["available_to_spend_paise"] == 500
+
+    empty_goal = client.post(
+        "/api/goals",
+        headers=headers,
+        json={"name": "Unfunded", "target_paise": 500},
+    )
+    empty_goal_id = UUID(empty_goal.json()["id"])
+    assert client.delete(f"/api/goals/{empty_goal_id}", headers=headers).status_code == 204
+    assert session.scalar(
+        select(func.count()).select_from(GoalEntry).where(GoalEntry.goal_id == empty_goal_id)
+    ) == 0
+
+
+def test_goal_delete_post_flush_failure_rolls_back_all_compensations(postgres_model_session):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    goal = _make_goal(session, user, name="Rollback goal")
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account.id,
+        amount_paise=400,
+        entry_type="contribution",
+    )
+    other_account = _add_account(
+        session, user, name="Second rollback account", opening_paise=1_000
+    )
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=other_account.id,
+        amount_paise=300,
+        entry_type="contribution",
+    )
+    session.commit()
+
+    observed_flushed_compensation = False
+
+    def fail_after_compensation_flush(db, _flush_context):
+        nonlocal observed_flushed_compensation
+        flushed_count = db.connection().execute(
+            select(func.count()).select_from(GoalEntry).where(
+                GoalEntry.user_id == user.id,
+                GoalEntry.goal_id == goal.id,
+                GoalEntry.entry_type == "withdrawal",
+            )
+        ).scalar_one()
+        if flushed_count > 0:
+            observed_flushed_compensation = True
+            raise SQLAlchemyError("simulated failure after PostgreSQL flush")
+
+    event.listen(session, "after_flush_postexec", fail_after_compensation_flush)
+    try:
+        with pytest.raises(SQLAlchemyError, match="after PostgreSQL flush"):
+            delete_goal(session, user_id=user.id, goal_id=goal.id)
+    finally:
+        event.remove(session, "after_flush_postexec", fail_after_compensation_flush)
+        session.rollback()
+    assert observed_flushed_compensation
+    session.expire_all()
+
+    assert session.get(SavingsGoal, goal.id).deleted_at is None
+    assert session.scalar(
+        select(func.count()).select_from(GoalEntry).where(
+            GoalEntry.goal_id == goal.id,
+            GoalEntry.entry_type == "withdrawal",
+        )
+    ) == 0
+    assert session.scalar(
+        select(func.count()).select_from(GoalEntry).where(
+            GoalEntry.goal_id == goal.id,
+            GoalEntry.entry_type == "contribution",
+        )
+    ) == 2
+
+
+def test_concurrent_goal_withdrawals_cannot_overdraw_one_allocation(postgres_model_session):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 100
+    goal = _make_goal(session, user, name="Concurrent withdrawal")
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account.id,
+        amount_paise=100,
+        entry_type="contribution",
+    )
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def withdraw():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                entry = create_goal_entry(
+                    worker,
+                    user_id=user.id,
+                    goal_id=goal.id,
+                    account_id=account.id,
+                    amount_paise=60,
+                    entry_type="withdrawal",
+                )
+                worker.commit()
+                return entry.id
+            except ExcessiveGoalWithdrawalError:
+                worker.rollback()
+                return "insufficient-allocation"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(lambda _: withdraw(), range(2)))
+
+    assert outcomes.count("insufficient-allocation") == 1
+    assert len([value for value in outcomes if value != "insufficient-allocation"]) == 1
+    session.expire_all()
+    snapshot = get_goal(session, user_id=user.id, goal_id=goal.id)
+    account_snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert snapshot.allocated_paise == 40
+    assert account_snapshot.balance_paise == 100
+    assert account_snapshot.available_to_spend_paise == 60
+
+
+def test_goal_contribution_racing_deletion_leaves_no_stranded_allocation(postgres_model_session):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 100
+    goal = _make_goal(session, user, name="Delete race")
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account.id,
+        amount_paise=50,
+        entry_type="contribution",
+    )
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def contribute():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                create_goal_entry(
+                    worker,
+                    user_id=user.id,
+                    goal_id=goal.id,
+                    account_id=account.id,
+                    amount_paise=50,
+                    entry_type="contribution",
+                )
+                worker.commit()
+                return "contributed"
+            except GoalNotFoundError:
+                worker.rollback()
+                return "goal-already-deleted"
+
+    def delete():
+        with factory() as worker:
+            barrier.wait()
+            delete_goal(worker, user_id=user.id, goal_id=goal.id)
+            worker.commit()
+            return "deleted"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(contribute), executor.submit(delete)]
+        outcomes = [future.result() for future in futures]
+
+    assert "deleted" in outcomes
+    assert set(outcomes) <= {"deleted", "contributed", "goal-already-deleted"}
+    session.expire_all()
+    persisted_goal = session.get(SavingsGoal, goal.id)
+    assert persisted_goal.deleted_at is not None
+    entries = list(
+        session.scalars(select(GoalEntry).where(GoalEntry.goal_id == goal.id)).all()
+    )
+    contributions = sum(
+        entry.amount_paise for entry in entries if entry.entry_type == "contribution"
+    )
+    withdrawals = sum(
+        entry.amount_paise for entry in entries if entry.entry_type == "withdrawal"
+    )
+    assert contributions in {50, 100}
+    assert withdrawals == contributions
+    account_snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert account_snapshot.balance_paise == 100
+    assert account_snapshot.goal_allocated_paise == 0
+    assert account_snapshot.available_to_spend_paise == 100
+
+
+def test_concurrent_contributions_share_account_available_balance(postgres_model_session):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 100
+    goals = [
+        _make_goal(session, user, name="First concurrent goal"),
+        _make_goal(session, user, name="Second concurrent goal"),
+    ]
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def contribute(goal_id):
+        with factory() as worker:
+            barrier.wait()
+            try:
+                entry = create_goal_entry(
+                    worker,
+                    user_id=user.id,
+                    goal_id=goal_id,
+                    account_id=account.id,
+                    amount_paise=80,
+                    entry_type="contribution",
+                )
+                worker.commit()
+                return entry.id
+            except InsufficientAvailableToSpendError:
+                worker.rollback()
+                return "insufficient-available"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(contribute, [item.id for item in goals]))
+
+    assert outcomes.count("insufficient-available") == 1
+    assert len([value for value in outcomes if value != "insufficient-available"]) == 1
+    session.expire_all()
+    account_snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert account_snapshot.balance_paise == 100
+    assert account_snapshot.goal_allocated_paise == 80
+    assert account_snapshot.available_to_spend_paise == 20
+
+
+def test_goal_aggregate_safe_integer_limit_across_accounts(auth_http_client):
+    client, settings, session = auth_http_client
+    user, account_a, _ = _make_financial_user(session)
+    account_a.opening_balance_paise = MAX_SAFE_PAISE
+    account_b = _add_account(
+        session, user, name="Boundary account", opening_paise=MAX_SAFE_PAISE
+    )
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    created = client.post(
+        "/api/goals",
+        headers=headers,
+        json={"name": "Safe aggregate", "target_paise": MAX_SAFE_PAISE},
+    )
+    assert created.status_code == 201
+    goal_id = UUID(created.json()["id"])
+
+    first = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account_a.id), "amount_paise": MAX_SAFE_PAISE},
+    )
+    assert first.status_code == 201
+
+    overflow = client.post(
+        f"/api/goals/{goal_id}/contributions",
+        headers=headers,
+        json={"account_id": str(account_b.id), "amount_paise": 1},
+    )
+    assert overflow.status_code == 409
+    session.expire_all()
+    snapshot = get_goal(session, user_id=user.id, goal_id=goal_id)
+    assert snapshot.allocated_paise == MAX_SAFE_PAISE
+    assert created.json()["target_paise"] - snapshot.allocated_paise == 0
+    assert get_account(session, user_id=user.id, account_id=account_b.id).goal_allocated_paise == 0
+
+
+def test_concurrent_cross_account_contributions_cannot_overflow_goal_aggregate(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account_a, _ = _make_financial_user(session)
+    account_a.opening_balance_paise = MAX_SAFE_PAISE
+    account_b = _add_account(session, user, name="Concurrent B", opening_paise=1)
+    account_c = _add_account(session, user, name="Concurrent C", opening_paise=1)
+    goal = _make_goal(
+        session, user, name="Concurrent safe aggregate", target_paise=MAX_SAFE_PAISE
+    )
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account_a.id,
+        amount_paise=MAX_SAFE_PAISE - 1,
+        entry_type="contribution",
+    )
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def contribute(account_id):
+        with factory() as worker:
+            barrier.wait()
+            try:
+                entry = create_goal_entry(
+                    worker,
+                    user_id=user.id,
+                    goal_id=goal.id,
+                    account_id=account_id,
+                    amount_paise=1,
+                    entry_type="contribution",
+                )
+                worker.commit()
+                return entry.id
+            except GoalAllocationLimitExceededError:
+                worker.rollback()
+                return "aggregate-limit"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(contribute, [account_b.id, account_c.id]))
+
+    assert outcomes.count("aggregate-limit") == 1
+    assert len([value for value in outcomes if value != "aggregate-limit"]) == 1
+    session.expire_all()
+    snapshot = get_goal(session, user_id=user.id, goal_id=goal.id)
+    assert snapshot.allocated_paise == MAX_SAFE_PAISE
+    assert 0 <= snapshot.allocated_paise <= MAX_SAFE_PAISE
+
+
+def test_goal_contributions_may_exceed_target_without_exceeding_safe_integer(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    goal = _make_goal(session, user, name="Overfunding decision", target_paise=500)
+    session.commit()
+
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account.id,
+        amount_paise=501,
+        entry_type="contribution",
+    )
+    session.commit()
+    snapshot = get_goal(session, user_id=user.id, goal_id=goal.id)
+    assert snapshot.allocated_paise == 501
+    assert goal.target_paise - snapshot.allocated_paise == -1
+
+
+def test_concurrent_expense_and_contribution_preserve_available_to_spend(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, expense_category = _make_financial_user(session)
+    account.opening_balance_paise = 100
+    goal = _make_goal(session, user, name="Expense contribution race")
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def contribute():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                create_goal_entry(
+                    worker,
+                    user_id=user.id,
+                    goal_id=goal.id,
+                    account_id=account.id,
+                    amount_paise=80,
+                    entry_type="contribution",
+                )
+                worker.commit()
+                return "contributed"
+            except InsufficientAvailableToSpendError:
+                worker.rollback()
+                return "contribution-rejected"
+
+    def spend():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                create_transaction(
+                    worker,
+                    user_id=user.id,
+                    account_id=account.id,
+                    category_id=expense_category.id,
+                    transaction_type="expense",
+                    amount_paise=50,
+                    description="Concurrent expense",
+                    transaction_date=financial_today(),
+                )
+                worker.commit()
+                return "spent"
+            except InvalidTransactionError:
+                worker.rollback()
+                return "expense-rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [executor.submit(contribute), executor.submit(spend)]
+        results = [future.result() for future in outcomes]
+
+    assert sum(result in {"contributed", "spent"} for result in results) == 1
+    session.expire_all()
+    snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert snapshot.available_to_spend_paise >= 0
+    assert snapshot.balance_paise >= snapshot.goal_allocated_paise
+
+
+def test_concurrent_expense_and_withdrawal_preserve_available_to_spend(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, expense_category = _make_financial_user(session)
+    account.opening_balance_paise = 100
+    goal = _make_goal(session, user, name="Expense withdrawal race")
+    create_goal_entry(
+        session,
+        user_id=user.id,
+        goal_id=goal.id,
+        account_id=account.id,
+        amount_paise=80,
+        entry_type="contribution",
+    )
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def withdraw():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                create_goal_entry(
+                    worker,
+                    user_id=user.id,
+                    goal_id=goal.id,
+                    account_id=account.id,
+                    amount_paise=30,
+                    entry_type="withdrawal",
+                )
+                worker.commit()
+                return "withdrew"
+            except ExcessiveGoalWithdrawalError:
+                worker.rollback()
+                return "withdrawal-rejected"
+
+    def spend():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                create_transaction(
+                    worker,
+                    user_id=user.id,
+                    account_id=account.id,
+                    category_id=expense_category.id,
+                    transaction_type="expense",
+                    amount_paise=50,
+                    description="Concurrent expense",
+                    transaction_date=financial_today(),
+                )
+                worker.commit()
+                return "spent"
+            except InvalidTransactionError:
+                worker.rollback()
+                return "expense-rejected"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [executor.submit(withdraw), executor.submit(spend)]
+        results = [future.result() for future in outcomes]
+
+    assert "withdrew" in results
+    session.expire_all()
+    snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert snapshot.available_to_spend_paise >= 0
+    assert snapshot.balance_paise >= snapshot.goal_allocated_paise
+
+
+def test_concurrent_opening_balance_update_and_contribution_serialize(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, _ = _make_financial_user(session)
+    account.opening_balance_paise = 100
+    goal = _make_goal(session, user, name="Opening balance race")
+    session.commit()
+    factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+
+    def update_opening_balance():
+        with factory() as worker:
+            barrier.wait()
+            try:
+                update_account(
+                    worker,
+                    user_id=user.id,
+                    account_id=account.id,
+                    changes={"opening_balance_paise": 200},
+                )
+                worker.commit()
+                return "updated"
+            except AccountOpeningBalanceLockedError:
+                worker.rollback()
+                return "locked-by-ledger"
+
+    def contribute():
+        with factory() as worker:
+            barrier.wait()
+            create_goal_entry(
+                worker,
+                user_id=user.id,
+                goal_id=goal.id,
+                account_id=account.id,
+                amount_paise=50,
+                entry_type="contribution",
+            )
+            worker.commit()
+            return "contributed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(update_opening_balance), executor.submit(contribute)]
+        results = [future.result() for future in futures]
+
+    assert "contributed" in results
+    assert results.count("updated") + results.count("locked-by-ledger") == 1
+    session.expire_all()
+    snapshot = get_account(session, user_id=user.id, account_id=account.id)
+    assert snapshot.balance_paise in {100, 200}
+    assert snapshot.goal_allocated_paise == 50
+    assert snapshot.available_to_spend_paise >= 0
