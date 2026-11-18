@@ -6,8 +6,8 @@ from datetime import date
 from typing import Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy.exc import SQLAlchemyError
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Response, status
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import AuthenticatedRequest, get_authenticated_request, require_csrf
@@ -19,13 +19,16 @@ from app.schemas.transactions import (
 )
 from app.services.transactions import (
     AccountNotFoundError,
+    IdempotencyConflictError,
     InvalidTransactionError,
     TransactionNotFoundError,
     TransactionPage,
     TransactionRecord,
     create_transaction,
+    get_idempotent_transaction,
     get_transaction,
     list_transactions,
+    transaction_request_fingerprint,
 )
 
 router = APIRouter(prefix="/api/transactions", tags=["transactions"])
@@ -56,12 +59,47 @@ def _rollback_error(db: Session, *, code: int, message: str) -> HTTPException:
 def _commit(db: Session) -> None:
     try:
         db.commit()
+    except IntegrityError:
+        raise
     except SQLAlchemyError:
         db.rollback()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Transaction could not be saved",
         ) from None
+
+
+def _is_idempotency_unique_violation(error: IntegrityError) -> bool:
+    original = error.orig
+    sqlstate = getattr(original, 'sqlstate', None) or getattr(original, 'pgcode', None)
+    diagnostic = getattr(original, 'diag', None)
+    constraint_name = getattr(diagnostic, 'constraint_name', None)
+    return sqlstate == '23505' and constraint_name == 'uq_transactions_user_idempotency_key'
+
+
+def _recover_idempotency_integrity_error(
+    db: Session,
+    *,
+    user_id: UUID,
+    idempotency_key: str,
+    payload: TransactionCreateRequest,
+) -> tuple[TransactionRecord | None, bool]:
+    # Return the winning row and whether its payload conflicts, if this was the key race.
+    replay = get_idempotent_transaction(
+        db, user_id=user_id, idempotency_key=idempotency_key
+    )
+    if replay is None:
+        return None, False
+    fingerprint = transaction_request_fingerprint(
+        account_id=payload.account_id,
+        category_id=payload.category_id,
+        transaction_type=payload.transaction_type,
+        amount_paise=payload.amount_paise,
+        description=payload.description,
+        transaction_date=payload.transaction_date,
+        notes=payload.notes,
+    )
+    return replay, replay.transaction.request_fingerprint != fingerprint
 
 
 def _commit_read_activity(db: Session) -> None:
@@ -113,6 +151,35 @@ def transactions(
     )
 
 
+@router.get("/operations/{idempotency_key}", response_model=TransactionResponse)
+def resolve_transaction_operation(
+    response: Response,
+    idempotency_key: str = Path(
+        min_length=16,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._~-]+$",
+    ),
+    authenticated: AuthenticatedRequest = Depends(get_authenticated_request),
+    db: Session = Depends(get_db),
+) -> TransactionResponse:
+    """Resolve a completed transaction-create operation for its owner."""
+
+    response.headers["Cache-Control"] = "no-store"
+    record = get_idempotent_transaction(
+        db,
+        user_id=authenticated.current_user.user_id,
+        idempotency_key=idempotency_key,
+    )
+    _commit_read_activity(db)
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Operation not found",
+            headers={"Cache-Control": "no-store"},
+        )
+    return _transaction_response(record)
+
+
 @router.get("/{transaction_id}", response_model=TransactionResponse)
 def transaction(
     transaction_id: UUID,
@@ -144,6 +211,12 @@ def transaction(
 def post_transaction(
     payload: TransactionCreateRequest,
     response: Response,
+    idempotency_key: str = Header(
+        alias="Idempotency-Key",
+        min_length=16,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9._~-]+$",
+    ),
     authenticated: AuthenticatedRequest = Depends(get_authenticated_request),
     db: Session = Depends(get_db),
 ) -> TransactionResponse:
@@ -160,12 +233,43 @@ def post_transaction(
             description=payload.description,
             transaction_date=payload.transaction_date,
             notes=payload.notes,
+            idempotency_key=idempotency_key,
         )
         _commit(db)
+    except IdempotencyConflictError:
+        raise _rollback_error(
+            db, code=409, message="Idempotency-Key was already used for a different transaction"
+        ) from None
     except AccountNotFoundError:
         raise _rollback_error(db, code=404, message="Account not found") from None
     except InvalidTransactionError as error:
         raise _rollback_error(db, code=422, message=str(error)) from None
+    except IntegrityError as error:
+        # Roll back every integrity failure, but replay only this named unique
+        # violation. Other unique/FK/check errors must remain ordinary failures.
+        db.rollback()
+        if not _is_idempotency_unique_violation(error):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Transaction could not be saved",
+            ) from None
+        replay, conflicts = _recover_idempotency_integrity_error(
+            db,
+            user_id=authenticated.current_user.user_id,
+            idempotency_key=idempotency_key,
+            payload=payload,
+        )
+        if replay is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Transaction could not be saved",
+            ) from None
+        if conflicts:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Idempotency-Key was already used for a different transaction",
+            ) from None
+        record = replay
 
     response.headers["Cache-Control"] = "no-store"
     return _transaction_response(record)

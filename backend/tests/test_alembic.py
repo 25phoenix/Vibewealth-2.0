@@ -35,6 +35,7 @@ def test_alembic_uses_application_metadata_and_settings() -> None:
         "auth_sessions",
         "assistant_conversations",
         "assistant_messages",
+        "assistant_turns",
         "budgets",
         "categories",
         "goal_entries",
@@ -53,21 +54,27 @@ def test_autogeneration_ignores_unmodeled_reflected_tables() -> None:
     assert include_object(object(), "new_table", "table", False, None) is True
 
 
-def test_goal_migration_follows_auth_session_revision() -> None:
+def test_migration_chain_tracks_assistant_turn_revision() -> None:
     script_directory = ScriptDirectory.from_config(load_alembic_config())
 
     revisions = list(script_directory.walk_revisions())
-    assert len(revisions) == 3
+    assert len(revisions) == 5
     assert script_directory.get_heads() == [revisions[0].revision]
-    assert revisions[0].revision == "6b9c2f1d4a80"
-    assert revisions[0].down_revision == "e7a30067c81c"
-    assert revisions[0].doc == "add goal descriptions and goal-scoped ledger index"
-    assert revisions[1].revision == "e7a30067c81c"
-    assert revisions[1].down_revision == "4da570f34c63"
-    assert revisions[1].doc == "add authentication sessions"
-    assert revisions[2].revision == "4da570f34c63"
-    assert revisions[2].down_revision is None
-    assert revisions[2].doc == "initial schema"
+    assert revisions[0].revision == "9d4e7a2c6b10"
+    assert revisions[0].down_revision == "8c2d6f4a1b90"
+    assert revisions[0].doc == "persist assistant turns and fenced attempt state"
+    assert revisions[1].revision == "8c2d6f4a1b90"
+    assert revisions[1].down_revision == "6b9c2f1d4a80"
+    assert revisions[1].doc == "persist transaction creation idempotency keys"
+    assert revisions[2].revision == "6b9c2f1d4a80"
+    assert revisions[2].down_revision == "e7a30067c81c"
+    assert revisions[2].doc == "add goal descriptions and goal-scoped ledger index"
+    assert revisions[3].revision == "e7a30067c81c"
+    assert revisions[3].down_revision == "4da570f34c63"
+    assert revisions[3].doc == "add authentication sessions"
+    assert revisions[4].revision == "4da570f34c63"
+    assert revisions[4].down_revision is None
+    assert revisions[4].doc == "initial schema"
 
 
 def test_upgrade_and_downgrade_use_isolated_sqlite_database(tmp_path: Path) -> None:

@@ -1,13 +1,15 @@
-import { ArrowUpRight, Menu, Sparkles } from 'lucide-react'
+import { ArrowUpRight, LogOut, Menu, Sparkles } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { SidebarTrigger } from '@/components/ui/sidebar'
 
 interface HeaderProps {
   title: string
   onAssistantClick: () => void
+  onLogout: () => void
+  isLoggingOut: boolean
 }
 
-export function Header({ title, onAssistantClick }: HeaderProps) {
+export function Header({ title, onAssistantClick, onLogout, isLoggingOut }: HeaderProps) {
   return (
     <header className="topbar">
       <div className="flex min-w-0 items-center gap-2">
@@ -21,11 +23,25 @@ export function Header({ title, onAssistantClick }: HeaderProps) {
           <strong>{title}</strong>
         </div>
       </div>
-      <Button variant="secondary" size="sm" onClick={onAssistantClick} className="ask-vibe rounded-lg px-3 font-medium">
-        <Sparkles aria-hidden="true" />
-        <span>Ask Vibe</span>
-        <ArrowUpRight aria-hidden="true" className="ask-vibe-arrow" />
-      </Button>
+      <div className="flex shrink-0 items-center gap-1.5">
+        <Button variant="secondary" size="sm" onClick={onAssistantClick} className="ask-vibe rounded-lg px-3 font-medium">
+          <Sparkles aria-hidden="true" />
+          <span>Ask Vibe</span>
+          <ArrowUpRight aria-hidden="true" className="ask-vibe-arrow" />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onLogout}
+          disabled={isLoggingOut}
+          aria-label={isLoggingOut ? 'Signing out' : 'Sign out'}
+          className="rounded-lg px-2.5 text-muted-foreground"
+        >
+          <LogOut aria-hidden="true" />
+          <span className="hidden sm:inline">{isLoggingOut ? 'Signing out…' : 'Sign out'}</span>
+        </Button>
+      </div>
     </header>
   )
 }

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
+import hashlib
+import json
 from typing import Literal
 from uuid import UUID
 
@@ -25,6 +27,10 @@ class TransactionNotFoundError(LookupError):
 
 class InvalidTransactionError(ValueError):
     """A transaction violates a product or financial invariant."""
+
+
+class IdempotencyConflictError(ValueError):
+    """An idempotency key was already used for a different normalized payload."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,8 +58,29 @@ def create_transaction(
     description: str,
     transaction_date: date,
     notes: str | None = None,
+    idempotency_key: str | None = None,
 ) -> TransactionRecord:
     """Validate and stage one transaction, leaving commit ownership to caller."""
+
+    description = description.strip()
+    notes = notes.strip() or None if notes is not None else None
+    fingerprint = transaction_request_fingerprint(
+        account_id=account_id,
+        category_id=category_id,
+        transaction_type=transaction_type,
+        amount_paise=amount_paise,
+        description=description,
+        transaction_date=transaction_date,
+        notes=notes,
+    )
+    if idempotency_key is not None:
+        existing = get_idempotent_transaction(
+            db, user_id=user_id, idempotency_key=idempotency_key
+        )
+        if existing is not None:
+            if existing.transaction.request_fingerprint != fingerprint:
+                raise IdempotencyConflictError
+            return existing
 
     _validate_transaction_values(
         transaction_type=transaction_type,
@@ -75,6 +102,18 @@ def create_transaction(
     )
     if account is None:
         raise AccountNotFoundError
+
+    # Recheck after locking the account. Concurrent requests for the same
+    # account/key serialize here, so a replay never reruns balance validation
+    # or applies the financial write a second time.
+    if idempotency_key is not None:
+        existing = get_idempotent_transaction(
+            db, user_id=user_id, idempotency_key=idempotency_key
+        )
+        if existing is not None:
+            if existing.transaction.request_fingerprint != fingerprint:
+                raise IdempotencyConflictError
+            return existing
 
     today = financial_today()
     if transaction_date < account.opening_balance_as_of:
@@ -126,14 +165,57 @@ def create_transaction(
         category_id=category.id,
         transaction_type=transaction_type,
         amount_paise=amount_paise,
-        description=description.strip(),
+        description=description,
         transaction_date=transaction_date,
         notes=notes,
+        idempotency_key=idempotency_key,
+        request_fingerprint=fingerprint if idempotency_key is not None else None,
     )
     db.add(transaction)
     db.flush()
     db.refresh(transaction)
     return TransactionRecord(transaction=transaction, category_name=category.name)
+
+
+def transaction_request_fingerprint(
+    *,
+    account_id: UUID,
+    category_id: UUID,
+    transaction_type: str,
+    amount_paise: int,
+    description: str,
+    transaction_date: date,
+    notes: str | None,
+) -> str:
+    """Hash the canonical, normalized transaction-creation payload."""
+
+    canonical_payload = {
+        "account_id": str(account_id),
+        "category_id": str(category_id),
+        "transaction_type": transaction_type,
+        "amount_paise": amount_paise,
+        "description": description.strip(),
+        "transaction_date": transaction_date.isoformat(),
+        "notes": notes.strip() or None if notes is not None else None,
+    }
+    encoded = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def get_idempotent_transaction(
+    db: Session, *, user_id: UUID, idempotency_key: str
+) -> TransactionRecord | None:
+    """Look up a completed transaction-create operation for this user only."""
+
+    row = _transaction_select().where(
+        Transaction.user_id == user_id,
+        Transaction.idempotency_key == idempotency_key,
+    )
+    result = db.execute(row).one_or_none()
+    if result is None:
+        return None
+    transaction, category_name = result
+    return TransactionRecord(transaction=transaction, category_name=category_name)
 
 
 def get_transaction(

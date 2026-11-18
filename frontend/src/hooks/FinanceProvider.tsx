@@ -113,7 +113,6 @@ export function FinanceProvider({ children, repository, assistantService }: Fina
     updateGoal: (id, draft) => runMutation(() => repository.updateGoal(id, draft)),
     deleteGoal: (id) => runMutation(() => repository.deleteGoal(id)),
     moveGoalMoney: (id, amount, direction) => runMutation(() => repository.moveGoalMoney(id, amount, direction)),
-    updateProfile: (profile) => runMutation(() => repository.updateProfile(profile)),
   }), [assistantService, isLoading, loadError, mutationError, pendingCount, preferences, repository, retryLoad, runMutation, snapshot])
 
   return <FinanceContext.Provider value={value}>{children}</FinanceContext.Provider>

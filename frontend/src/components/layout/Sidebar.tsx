@@ -1,5 +1,4 @@
 import { Sprout } from 'lucide-react'
-import { Badge } from '@/components/ui/badge'
 import {
   Sidebar,
   SidebarContent,
@@ -14,7 +13,8 @@ import {
   SidebarMenuItem,
   SidebarSeparator,
 } from '@/components/ui/sidebar'
-import { useFinance } from '@/hooks/useFinance'
+import { useAuth } from '@/hooks/authContext'
+import { authenticatedDisplayName } from '@/lib/authIdentity'
 import { navigationItems, settingsItem, type NavigationItem } from './navigation'
 
 interface SidebarProps {
@@ -23,8 +23,8 @@ interface SidebarProps {
 }
 
 export function AppSidebar({ activePage, onNavigate }: SidebarProps) {
-  const { snapshot } = useFinance()
-  const profileName = snapshot.profile.name
+  const { user } = useAuth()
+  const profileName = authenticatedDisplayName(user)
   const initials = profileName.split(/\s+/).map((part) => part[0]).slice(0, 2).join('').toUpperCase()
 
   const renderItem = (item: NavigationItem) => {
@@ -66,9 +66,8 @@ export function AppSidebar({ activePage, onNavigate }: SidebarProps) {
           <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary text-xs font-semibold text-secondary-foreground">{initials.slice(0, 1)}</div>
           <div className="grid min-w-0 gap-0.5">
             <span className="truncate text-xs font-medium text-foreground">{profileName}</span>
-            <span className="truncate text-[10px] text-muted-foreground">Personal workspace</span>
+            <span className="truncate text-[10px] text-muted-foreground">{user?.email || 'Personal workspace'}</span>
           </div>
-          <Badge variant="outline" className="ml-auto border-transparent bg-secondary px-1.5 text-[9px] text-secondary-foreground">Demo</Badge>
         </div>
       </SidebarHeader>
 

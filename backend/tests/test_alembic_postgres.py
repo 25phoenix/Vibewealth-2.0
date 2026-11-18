@@ -2,33 +2,19 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from uuid import uuid4
 
-import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.engine import make_url
-
-from app.core.config import get_settings
+from tests.postgres_safety import postgres_test_url
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
 
 def test_goal_migration_upgrade_and_downgrade_in_isolated_postgres_schema():
-    raw_url = os.getenv("POSTGRES_TEST_DATABASE_URL")
-    if not raw_url:
-        pytest.skip("Set POSTGRES_TEST_DATABASE_URL to the isolated local test database")
-
-    test_url = make_url(raw_url)
-    application_url = get_settings().sqlalchemy_url
-    assert test_url.drivername == "postgresql+psycopg"
-    assert test_url.host in {"localhost", "127.0.0.1", "::1"}
-    assert test_url.port == application_url.port == 5432
-    assert test_url.database == "vibewealth_test"
-    assert test_url.database != application_url.database
+    test_url = postgres_test_url()
 
     engine = create_engine(test_url, pool_pre_ping=True)
     schema = f"alembic_test_{uuid4().hex}"
@@ -44,6 +30,30 @@ def test_goal_migration_upgrade_and_downgrade_in_isolated_postgres_schema():
             config.attributes["connection"] = connection
 
             command.upgrade(config, "head")
+            inspector = inspect(connection)
+            transaction_columns = {
+                column["name"] for column in inspector.get_columns("transactions")
+            }
+            assert {"idempotency_key", "request_fingerprint"} <= transaction_columns
+            unique_constraints = {
+                item["name"]
+                for item in inspector.get_unique_constraints("transactions")
+            }
+            assert "uq_transactions_user_idempotency_key" in unique_constraints
+            check_constraints = {
+                item["name"]
+                for item in inspector.get_check_constraints("transactions")
+            }
+            assert "ck_transactions_idempotency_pair" in check_constraints
+
+            command.downgrade(config, "6b9c2f1d4a80")
+            transaction_columns = {
+                column["name"] for column in inspect(connection).get_columns("transactions")
+            }
+            assert "idempotency_key" not in transaction_columns
+            assert "request_fingerprint" not in transaction_columns
+            command.upgrade(config, "head")
+
             inspector = inspect(connection)
             assert "description" in {
                 column["name"] for column in inspector.get_columns("savings_goals")

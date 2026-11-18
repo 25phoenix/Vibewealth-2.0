@@ -7,7 +7,7 @@ from datetime import date, datetime
 from typing import Final
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -44,8 +44,7 @@ class BudgetSnapshot:
     def percent_used_basis_points(self) -> int:
         """Return percent used in hundredths of a percent, rounded half-up."""
 
-        numerator = self.actual_spending_paise * 10_000
-        return (numerator + self.budget.limit_paise // 2) // self.budget.limit_paise
+        return percent_used_basis_points(self.actual_spending_paise, self.budget.limit_paise)
 
 
 def list_budgets(
@@ -159,6 +158,10 @@ def _load_snapshots(
     budget_id: UUID | None = None,
     month_start: date | None = None,
 ) -> list[BudgetSnapshot]:
+    if month_start is not None:
+        statement = month_snapshot_statement(user_id=user_id, month_start=month_start)
+        if budget_id is not None: statement = statement.where(Budget.id == budget_id)
+        return [BudgetSnapshot(budget, name, int(actual)) for budget, name, actual in db.execute(statement)]
     statement = (
         select(Budget, Category.name)
         .outerjoin(
@@ -190,12 +193,7 @@ def _load_snapshots(
             Transaction.category_id,
             func.sum(Transaction.amount_paise),
         )
-        .where(
-            Transaction.user_id == user_id,
-            Transaction.transaction_type == "expense",
-            Transaction.deleted_at.is_(None),
-            Transaction.transaction_date >= first_month,
-        )
+        .where(*expense_conditions(user_id=user_id, start=first_month))
         .group_by(Transaction.transaction_date, Transaction.category_id)
     )
     end_month = _next_month(max(months))
@@ -292,3 +290,31 @@ def _next_month(month_start: date) -> date | None:
             return None
         return date(month_start.year + 1, 1, 1)
     return date(month_start.year, month_start.month + 1, 1)
+
+
+def expense_conditions(*, user_id: UUID, start: date, end: date | None = None):
+    """Shared complete recorded-expense scope, intentionally unlike cash flow.
+
+    Includes uncategorized/archived history; no opening-date/today cutoff.
+    """
+    result = (Transaction.user_id == user_id, Transaction.deleted_at.is_(None),
+              Transaction.transaction_type == "expense", Transaction.transaction_date >= start)
+    return result + ((Transaction.transaction_date < end,) if end is not None else ())
+
+
+def month_snapshot_statement(*, user_id: UUID, month_start: date):
+    """Complete monthly expense totals; one grouped source, no opening/today cutoff."""
+    spending = select(Transaction.category_id, func.sum(Transaction.amount_paise).label("amount")).where(
+        *expense_conditions(user_id=user_id, start=month_start, end=_next_month(month_start))
+    ).group_by(Transaction.category_id).subquery()
+    overall = select(func.coalesce(func.sum(spending.c.amount), 0)).correlate(None).scalar_subquery()
+    actual = case((Budget.category_id.is_(None), overall), else_=func.coalesce(spending.c.amount, 0)).label("actual_spending_paise")
+    return select(Budget, Category.name.label("category_name"), actual).outerjoin(
+        Category, (Category.user_id == Budget.user_id) & (Category.id == Budget.category_id)
+    ).outerjoin(spending, spending.c.category_id == Budget.category_id).where(
+        Budget.user_id == user_id, Budget.month_start == month_start
+    ).order_by(Budget.category_id.is_not(None), Budget.category_id, Budget.id)
+
+
+def percent_used_basis_points(actual: int, limit: int) -> int:
+    return (actual * 10000 + limit // 2) // limit

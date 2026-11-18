@@ -37,6 +37,9 @@ class Transaction(Base):
     __table_args__ = (
         PrimaryKeyConstraint("id", name="pk_transactions"),
         UniqueConstraint("user_id", "id", name="uq_transactions_user_id_id"),
+        UniqueConstraint(
+            "user_id", "idempotency_key", name="uq_transactions_user_idempotency_key"
+        ),
         ForeignKeyConstraint(
             ["user_id", "account_id"],
             ["accounts.user_id", "accounts.id"],
@@ -56,6 +59,10 @@ class Transaction(Base):
         CheckConstraint("transaction_type IN ('income', 'expense')", name="ck_transactions_type"),
         CheckConstraint("amount_paise > 0", name="ck_transactions_amount_positive"),
         CheckConstraint("length(btrim(description)) > 0", name="ck_transactions_description_nonempty"),
+        CheckConstraint(
+            "(idempotency_key IS NULL) = (request_fingerprint IS NULL)",
+            name="ck_transactions_idempotency_pair",
+        ),
         Index(
             "ix_transactions_user_date_live",
             "user_id",
@@ -94,6 +101,8 @@ class Transaction(Base):
     description: Mapped[str] = mapped_column(String(120), nullable=False)
     transaction_date: Mapped[date] = mapped_column(Date, nullable=False)
     notes: Mapped[str | None] = mapped_column(Text)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    request_fingerprint: Mapped[str | None] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

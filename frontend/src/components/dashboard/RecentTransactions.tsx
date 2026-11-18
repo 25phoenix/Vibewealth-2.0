@@ -2,17 +2,15 @@ import { ArrowDownLeft, ArrowUpRight } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { formatCurrency, formatDate } from '@/lib/format'
-import type { Transaction } from '@/types/finance'
-import type { CurrencyCode } from '@/types/preferences'
+import { formatDate, formatPaiseExact } from '@/lib/format'
+import type { DashboardTransactionDto } from '@/types/api'
 
 interface RecentTransactionsProps {
-  transactions: Transaction[]
-  currency: CurrencyCode
+  transactions: DashboardTransactionDto[]
   onViewAll: () => void
 }
 
-export function RecentTransactions({ transactions, currency, onViewAll }: RecentTransactionsProps) {
+export function RecentTransactions({ transactions, onViewAll }: RecentTransactionsProps) {
   return (
     <Card className="dashboard-card transactions-panel gap-0 py-0">
       <CardHeader className="panel-header">
@@ -25,24 +23,25 @@ export function RecentTransactions({ transactions, currency, onViewAll }: Recent
       <CardContent className="transactions-content">
         <ul className="transaction-list">
           {transactions.map((transaction) => {
-            const isIncome = transaction.type === 'income'
+            const isIncome = transaction.transaction_type === 'income'
             const DirectionIcon = isIncome ? ArrowDownLeft : ArrowUpRight
 
             return (
               <li className="transaction-row" key={transaction.id}>
-                <span className={`merchant-avatar merchant-${transaction.type}`} aria-hidden="true">{transaction.description.slice(0, 2).toUpperCase()}</span>
+                <span className={`merchant-avatar ${isIncome ? 'merchant-mint' : 'merchant-blue'}`} aria-hidden="true">{transaction.description.slice(0, 2).toUpperCase()}</span>
                 <span className="merchant-copy">
                   <strong>{transaction.description}</strong>
-                  <span>{formatDate(transaction.date)}</span>
+                  <span>{formatDate(transaction.transaction_date)}</span>
                 </span>
-                <Badge variant="outline" className="transaction-category">{transaction.category}</Badge>
+                <Badge variant="outline" className="transaction-category">{transaction.category_name ?? 'Uncategorized'}</Badge>
                 <strong className={`transaction-amount ${isIncome ? 'income-amount' : 'expense-amount'}`}>
                   <DirectionIcon aria-hidden="true" size={14} />
-                  {isIncome ? '+' : '−'}{formatCurrency(transaction.amountPaise, currency)}
+                  {isIncome ? '+' : '−'}{formatPaiseExact(BigInt(transaction.amount_paise))}
                 </strong>
               </li>
             )
           })}
+          {transactions.length === 0 && <li className="py-8 text-center text-sm text-muted-foreground">No transactions have been recorded yet.</li>}
         </ul>
       </CardContent>
     </Card>

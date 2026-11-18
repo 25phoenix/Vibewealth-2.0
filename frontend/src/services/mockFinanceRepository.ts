@@ -129,4 +129,6 @@ export class MockFinanceRepository implements FinanceRepository {
   }
 }
 
-export const financeRepository = new MockFinanceRepository()
+export function createMockFinanceRepository(): MockFinanceRepository {
+  return new MockFinanceRepository()
+}

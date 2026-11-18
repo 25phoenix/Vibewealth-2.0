@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, iter_route_contexts
 from starlette.requests import Request
 from pydantic import SecretStr, ValidationError
 
@@ -216,8 +216,9 @@ def _dependency_calls(route):
 def _assert_unsafe_routes_protected(routes):
     public_pre_session_routes = {"/api/auth/register", "/api/auth/login"}
     unsafe_methods = {"POST", "PUT", "PATCH", "DELETE"}
-    for route in routes:
-        if not isinstance(route, APIRoute):
+    inspected = set()
+    for route in iter_route_contexts(routes):
+        if not isinstance(route.route, APIRoute):
             continue
         if not (route.methods & unsafe_methods):
             continue
@@ -225,12 +226,25 @@ def _assert_unsafe_routes_protected(routes):
         if route.path in public_pre_session_routes:
             assert require_trusted_origin in calls, route.path
         else:
-            assert require_csrf in calls, route.path
+            from app.api.assistant_dependencies import assistant_csrf
+            assert require_csrf in calls or assistant_csrf in calls, route.path
+        inspected.update((method, route.path) for method in route.methods & unsafe_methods)
+    return inspected
 
 
 def test_all_unsafe_routes_have_origin_or_csrf_protection():
     application = create_app(_settings())
-    _assert_unsafe_routes_protected(application.routes)
+    inspected = _assert_unsafe_routes_protected(application.routes)
+    assert {
+        ("POST", "/api/assistant/conversations"),
+        ("DELETE", "/api/assistant/conversations/{conversation_id}"),
+        ("POST", "/api/assistant/conversations/{conversation_id}/messages"),
+        ("POST", "/api/assistant/conversations/{conversation_id}/turns/{turn_id}/retry"),
+        ("POST", "/api/assistant/conversations/{conversation_id}/turns/{turn_id}/abandon"),
+        ("POST", "/api/auth/register"), ("POST", "/api/auth/login"),
+        ("POST", "/api/auth/logout"), ("POST", "/api/transactions"),
+        ("PATCH", "/api/accounts/{account_id}"),
+    } <= inspected
 
 
 def test_route_inventory_detects_an_unprotected_future_write():
@@ -244,6 +258,17 @@ def test_route_inventory_detects_an_unprotected_future_write():
     )
     with pytest.raises(AssertionError):
         _assert_unsafe_routes_protected([unprotected])
+
+
+def test_route_inventory_detects_an_unprotected_write_in_included_routers():
+    from fastapi import APIRouter
+
+    nested = APIRouter()
+    nested.add_api_route("/unprotected", lambda: {"ok": True}, methods=["POST"])
+    root = APIRouter()
+    root.include_router(nested, prefix="/nested")
+    with pytest.raises(AssertionError, match="/nested/unprotected"):
+        _assert_unsafe_routes_protected(root.routes)
 
 
 def test_csrf_token_is_deterministic_domain_bound_and_session_bound():
@@ -289,7 +314,7 @@ def test_csrf_dependency_uses_constant_time_comparison(monkeypatch):
     assert raised.value.status_code == 403
 
 
-def test_cors_preflight_is_limited_to_explicit_origin_and_auth_headers():
+def test_cors_preflight_is_limited_to_explicit_origin_and_write_headers():
     app = create_app(_settings())
     with TestClient(app) as client:
         response = client.options(
@@ -315,6 +340,14 @@ def test_cors_preflight_is_limited_to_explicit_origin_and_auth_headers():
                 "Access-Control-Request-Headers": "content-type,x-csrf-token",
             },
         )
+        transaction_create = client.options(
+            "/api/transactions",
+            headers={
+                "Origin": FRONTEND_ORIGIN,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,x-csrf-token,idempotency-key",
+            },
+        )
         budget_delete = client.options(
             "/api/budgets/00000000-0000-0000-0000-000000000001",
             headers={
@@ -335,6 +368,8 @@ def test_cors_preflight_is_limited_to_explicit_origin_and_auth_headers():
     assert response.headers["access-control-allow-origin"] == FRONTEND_ORIGIN
     assert response.headers["access-control-allow-credentials"] == "true"
     assert account_patch.status_code == 200
+    assert transaction_create.status_code == 200
+    assert "idempotency-key" in transaction_create.headers["access-control-allow-headers"].lower()
     assert "PATCH" in account_patch.headers["access-control-allow-methods"]
     assert budget_delete.status_code == 200
     assert "DELETE" in budget_delete.headers["access-control-allow-methods"]

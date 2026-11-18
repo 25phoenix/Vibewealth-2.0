@@ -11,6 +11,8 @@ from pydantic import ValidationError
 
 from app.core.financial import MAX_SAFE_PAISE, financial_today
 from app.schemas.transactions import TransactionCreateRequest
+from app.models import Transaction
+from sqlalchemy import CheckConstraint, UniqueConstraint
 from app.services.transactions import InvalidTransactionError, create_transaction, list_transactions
 
 
@@ -31,6 +33,27 @@ def _payload(**overrides):
 def test_transaction_schema_rejects_invalid_paise_amounts(amount):
     with pytest.raises(ValidationError):
         TransactionCreateRequest(**_payload(amount_paise=amount))
+
+
+def test_transaction_idempotency_schema_supports_legacy_rows_and_user_scoped_uniqueness():
+    table = Transaction.__table__
+    assert table.c.idempotency_key.nullable is True
+    assert table.c.request_fingerprint.nullable is True
+    unique = next(
+        constraint
+        for constraint in table.constraints
+        if isinstance(constraint, UniqueConstraint)
+        and constraint.name == "uq_transactions_user_idempotency_key"
+    )
+    assert tuple(column.name for column in unique.columns) == ("user_id", "idempotency_key")
+    check = next(
+        constraint
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_transactions_idempotency_pair"
+    )
+    assert "idempotency_key IS NULL" in str(check.sqltext)
+    assert "request_fingerprint IS NULL" in str(check.sqltext)
 
 
 def test_transaction_schema_requires_category_and_rejects_extra_owner_field():

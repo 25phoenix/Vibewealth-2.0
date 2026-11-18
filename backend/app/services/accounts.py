@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date
 from uuid import UUID
 
-from sqlalchemy import case, func, select
+from sqlalchemy import Select, case, func, select
 from sqlalchemy.orm import Session
 
 from app.core.financial import MAX_SAFE_PAISE, financial_today
@@ -198,14 +198,13 @@ def update_account(
     return get_account(db, user_id=user_id, account_id=account_id)
 
 
-def _account_balance_query(
-    db: Session,
+def account_balance_statement(
     *,
     user_id: UUID,
     as_of: date,
     account_id: UUID | None = None,
     include_archived: bool = False,
-) -> list[tuple[Account, int, int, int]]:
+) -> Select:
     """Read account metadata and its complete financial snapshot in one statement.
 
     Grouped subqueries are joined to the account rows so PostgreSQL evaluates
@@ -266,7 +265,7 @@ def _account_balance_query(
     allocated = func.coalesce(allocation_net.c.net_paise, 0)
     available = actual_balance - allocated
     stmt = (
-        select(Account, actual_balance, allocated, available)
+        select(Account, actual_balance.label("balance_paise"), allocated.label("goal_allocated_paise"), available.label("available_to_spend_paise"))
         .outerjoin(
             transaction_net,
             (transaction_net.c.user_id == Account.user_id)
@@ -285,8 +284,12 @@ def _account_balance_query(
     if not include_archived:
         stmt = stmt.where(Account.archived_at.is_(None))
 
-    rows = db.execute(stmt).all()
-    return [
-        (account, int(balance), int(goal_allocated), int(available_to_spend))
-        for account, balance, goal_allocated, available_to_spend in rows
-    ]
+    return stmt
+
+
+def _account_balance_query(db: Session, *, user_id: UUID, as_of: date,
+                           account_id: UUID | None = None, include_archived: bool = False):
+    rows = db.execute(account_balance_statement(user_id=user_id, as_of=as_of,
+        account_id=account_id, include_archived=include_archived)).all()
+    return [(account, int(balance), int(allocated), int(available))
+            for account, balance, allocated, available in rows]

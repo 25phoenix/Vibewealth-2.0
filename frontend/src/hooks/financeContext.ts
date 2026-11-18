@@ -1,5 +1,5 @@
 import { createContext } from 'react'
-import type { BudgetDraft, FinanceSnapshot, SavingsGoalDraft, TransactionDraft, UserProfile } from '@/types/finance'
+import type { BudgetDraft, FinanceSnapshot, SavingsGoalDraft, TransactionDraft } from '@/types/finance'
 import type { UserPreferences } from '@/types/preferences'
 
 export interface FinanceContextValue {
@@ -23,7 +23,6 @@ export interface FinanceContextValue {
   updateGoal: (id: string, draft: SavingsGoalDraft) => Promise<void>
   deleteGoal: (id: string) => Promise<void>
   moveGoalMoney: (id: string, amountPaise: number, direction: 'add' | 'withdraw') => Promise<void>
-  updateProfile: (profile: UserProfile) => Promise<void>
 }
 
 export const FinanceContext = createContext<FinanceContextValue | null>(null)

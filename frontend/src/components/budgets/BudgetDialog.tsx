@@ -4,21 +4,22 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { FormField } from '@/components/shared/FormField'
-import { useFinance } from '@/hooks/useFinance'
-import { getCurrentMonthKey } from '@/lib/format'
+import { useAccountCategoryData } from '@/hooks/accountCategoryContext'
+import { formatMonth, getIndiaMonthStart } from '@/lib/format'
 import { parseAmountToPaise } from '@/lib/money'
-import type { Budget, BudgetDraft } from '@/types/finance'
+import type { BudgetDto, BudgetCreateInput } from '@/types/api'
 
 interface BudgetDialogProps {
   open: boolean
-  budget?: Budget
+  budget?: BudgetDto
   onOpenChange: (open: boolean) => void
-  onSave: (draft: BudgetDraft) => Promise<void>
+  onSave: (draft: BudgetCreateInput) => Promise<void>
   isSaving?: boolean
 }
 
 function rupeesInput(amountPaise: number) {
-  return `${Math.floor(amountPaise / 100)}.${String(amountPaise % 100).padStart(2, '0')}`
+  const exact = BigInt(amountPaise)
+  return `${exact / 100n}.${String(exact % 100n).padStart(2, '0')}`
 }
 
 export function BudgetDialog({ open, budget, onOpenChange, onSave, isSaving = false }: BudgetDialogProps) {
@@ -32,27 +33,24 @@ export function BudgetDialog({ open, budget, onOpenChange, onSave, isSaving = fa
 }
 
 function BudgetForm({ budget, onCancel, onSave, isSaving }: {
-  budget?: Budget
+  budget?: BudgetDto
   onCancel: () => void
-  onSave: (draft: BudgetDraft) => Promise<void>
+  onSave: (draft: BudgetCreateInput) => Promise<void>
   isSaving: boolean
 }) {
-  const { snapshot } = useFinance()
-  const [category, setCategory] = useState(budget?.category ?? '')
-  const [limit, setLimit] = useState(budget ? rupeesInput(budget.limitPaise) : '')
+  const { categories, retryCategories } = useAccountCategoryData()
+  const [categoryId, setCategoryId] = useState(budget?.category_id ?? '__overall')
+  const [limit, setLimit] = useState(budget ? rupeesInput(budget.limit_paise) : '')
   const [error, setError] = useState('')
-  const month = budget?.month ?? getCurrentMonthKey()
-  const expenseCategories = snapshot.categories.filter((item) => item.type !== 'income')
+  const monthStart = budget?.month_start ?? getIndiaMonthStart()
+  const expenseCategories = categories.data.filter((item) => item.transaction_type === 'expense')
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
     const limitPaise = parseAmountToPaise(limit)
-    if (!category) return setError('Choose a category for this budget.')
     if (!limitPaise) return setError('Enter a monthly limit greater than zero with up to two decimal places.')
-    const alreadyExists = snapshot.budgets.some((item) => item.month === month && item.category === category && item.id !== budget?.id)
-    if (alreadyExists) return setError('A budget already exists for this category and month.')
     try {
-      await onSave({ category, limitPaise, month })
+      await onSave({ month_start: monthStart, category_id: categoryId === '__overall' ? null : categoryId, limit_paise: limitPaise })
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Could not save budget. Please try again.')
     }
@@ -62,23 +60,24 @@ function BudgetForm({ budget, onCancel, onSave, isSaving }: {
     <>
       <DialogHeader>
         <DialogTitle>{budget ? 'Edit budget' : 'Create a budget'}</DialogTitle>
-        <DialogDescription>Set a monthly spending limit for one category.</DialogDescription>
+        <DialogDescription>Set a monthly spending limit for all spending or one expense category.</DialogDescription>
       </DialogHeader>
       <form onSubmit={handleSubmit} className="grid gap-4" noValidate>
         <FormField id="budget-category" label="Category">
-          <Select value={category} onValueChange={(value) => { if (value) setCategory(value) }}>
-            <SelectTrigger id="budget-category" className="w-full"><SelectValue placeholder="Choose a category" /></SelectTrigger>
-            <SelectContent>{expenseCategories.map((item) => <SelectItem key={item.name} value={item.name}>{item.name}</SelectItem>)}</SelectContent>
+          <Select value={categoryId} onValueChange={(value) => { if (value) setCategoryId(value) }}>
+            <SelectTrigger id="budget-category" className="w-full"><SelectValue /></SelectTrigger>
+            <SelectContent><SelectItem value="__overall">Overall monthly budget</SelectItem>{budget?.category_id && !expenseCategories.some((item) => item.id === budget.category_id) && <SelectItem value={budget.category_id}>{budget.category_name ?? 'Archived category'} (archived)</SelectItem>}{expenseCategories.map((item) => <SelectItem key={item.id} value={item.id}>{item.name}</SelectItem>)}</SelectContent>
           </Select>
         </FormField>
         <FormField id="budget-limit" label="Monthly limit (INR)">
           <Input id="budget-limit" type="number" min="0.01" step="0.01" inputMode="decimal" value={limit} onChange={(event) => setLimit(event.target.value)} placeholder="0.00" />
         </FormField>
-        <p className="text-xs text-muted-foreground">For {new Intl.DateTimeFormat('en-IN', { month: 'long', year: 'numeric' }).format(new Date(`${month}-01T00:00:00`))}</p>
+        {categories.status === 'error' && <div className="grid gap-2"><p role="alert" className="text-sm text-destructive">Could not load categories. Retry before creating or reassigning a category budget.</p><Button type="button" size="sm" variant="outline" onClick={() => void retryCategories()}>Retry categories</Button></div>}
+        <p className="text-xs text-muted-foreground">For {formatMonth(monthStart.slice(0, 7))}</p>
         {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
         <DialogFooter>
           <Button type="button" variant="outline" onClick={onCancel} disabled={isSaving}>Cancel</Button>
-          <Button type="submit" disabled={isSaving}>{isSaving ? 'Saving…' : budget ? 'Save budget' : 'Create budget'}</Button>
+          <Button type="submit" disabled={isSaving || (categoryId !== '__overall' && categories.status !== 'success')}>{isSaving ? 'Saving…' : budget ? 'Save budget' : 'Create budget'}</Button>
         </DialogFooter>
       </form>
     </>

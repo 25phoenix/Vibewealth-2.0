@@ -11,12 +11,14 @@ from app.models.savings_goal import SavingsGoal
 from app.models.goal_entry import GoalEntry
 from app.models.assistant_conversation import AssistantConversation
 from app.models.assistant_message import AssistantMessage
+from app.models.assistant_turn import AssistantTurn
 
 __all__ = [
     "Account",
     "AuthSession",
     "AssistantConversation",
     "AssistantMessage",
+    "AssistantTurn",
     "Base",
     "Budget",
     "Category",

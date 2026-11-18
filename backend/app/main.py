@@ -7,6 +7,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
+from app.api.assistant_http import AssistantNoStoreMiddleware
+from app.core.assistant_rate_limit import AssistantRateLimiter
+from app.core.assistant_admission import AssistantAdmission
 from app.core.config import Settings, get_settings
 from app.core.database import dispose_engine, engine
 from app.core.rate_limit import InMemoryAuthRateLimiter
@@ -35,14 +38,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.state.settings = configured_settings
     application.state.auth_rate_limiter = InMemoryAuthRateLimiter()
+    application.state.assistant_rate_limiter = AssistantRateLimiter()
+    application.state.assistant_admission = AssistantAdmission()
     application.add_middleware(
         CORSMiddleware,
         allow_origins=configured_settings.allowed_frontend_origins,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["Content-Type", "X-CSRF-Token"],
+        allow_headers=["Content-Type", "X-CSRF-Token", "Idempotency-Key"],
+        expose_headers=["Retry-After"],
         max_age=600,
     )
+    application.add_middleware(AssistantNoStoreMiddleware)
     application.include_router(router)
     return application
 

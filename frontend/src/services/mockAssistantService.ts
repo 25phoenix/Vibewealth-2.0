@@ -4,7 +4,6 @@ import type { FinanceSnapshot } from '@/types/finance'
 import type { AssistantService } from './assistantService'
 import type { FinanceRepository } from './financeRepository'
 import { getCurrentMonthKey } from '@/lib/format'
-import { financeRepository } from './mockFinanceRepository'
 
 function previousMonthKey(month: string) {
   const [year, monthNumber] = month.split('-').map(Number)
@@ -86,5 +85,3 @@ export class MockAssistantService implements AssistantService {
     return getMockAssistantReply(question, this.repository.getSnapshot(), getCurrentMonthKey())
   }
 }
-
-export const mockAssistantService = new MockAssistantService(financeRepository)

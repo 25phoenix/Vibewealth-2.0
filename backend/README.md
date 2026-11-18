@@ -6,8 +6,9 @@ categories, transactions, budgets, savings goals and entries, assistant
 conversations and messages, and authentication sessions. It provides health
 endpoints and cookie-based registration, login, current-user, CSRF-token, and
 logout endpoints. Authentication uses Argon2id password hashes and
-PostgreSQL-backed opaque sessions. Transaction editing/import APIs, a
-persistent assistant service, and live AI integration are not implemented.
+PostgreSQL-backed opaque sessions. Transaction editing/import APIs remain unimplemented; live AI provider activation remains gated. Persistent assistant conversation and turn APIs, bounded reporting, grounding and a disabled local transport are implemented; see ../docs/phase-9-implementation-status.md. The
+authenticated dashboard summary combines current account, monthly cash-flow,
+budget, goal, and recent-transaction data in one read-only endpoint.
 Schema changes are managed explicitly with Alembic.
 
 This backend is not a declaration of public launch readiness. Account recovery,
@@ -120,13 +121,15 @@ reachable. Current endpoints are:
 | `GET` | `/api/auth/csrf` | Returns a session-bound CSRF token |
 | `POST` | `/api/auth/logout` | Revokes the current session and clears its cookie |
 | `GET` | `/api/accounts` | Lists the user's active accounts and current balances |
+| `GET` | `/api/dashboard/summary` | Returns authenticated current-month account, cash-flow, budget, goal, and recent-transaction summaries |
 | `GET` | `/api/accounts/{account_id}` | Retrieves one owned account and its current balance |
 | `GET` | `/api/accounts/{account_id}/balance?as_of=YYYY-MM-DD` | Calculates a current or historical balance; `as_of` is optional |
 | `PATCH` | `/api/accounts/{account_id}` | Updates account name/type and, before the first transaction, opening balance/date |
 | `GET` | `/api/categories` | Lists the authenticated user's active categories for selection |
-| `POST` | `/api/transactions` | Creates an income or expense transaction; requires CSRF protection |
+| `POST` | `/api/transactions` | Creates an income or expense transaction; requires CSRF and an `Idempotency-Key` header |
 | `GET` | `/api/transactions` | Lists live transactions with filters and pagination |
 | `GET` | `/api/transactions/{transaction_id}` | Retrieves one owned live transaction |
+| `GET` | `/api/transactions/operations/{idempotency_key}` | Resolves the authenticated user's completed transaction-create operation |
 | `GET` | `/api/budgets?month_start=YYYY-MM-01` | Lists owned budgets and actual spending; month filter is optional |
 | `GET` | `/api/budgets/{budget_id}` | Retrieves one owned budget and its actual spending |
 | `POST` | `/api/budgets` | Creates an overall or active expense-category budget; requires CSRF protection |
@@ -144,10 +147,38 @@ reachable. Current endpoints are:
 Account and transaction reads require a valid session. Category reads also
 require a valid session; category listing excludes archived categories and
 other users' categories. Account updates and transaction creation also require
-the trusted Origin and session-bound CSRF header. Account
-creation/deletion and transaction editing/deletion endpoints are not exposed.
-Registration remains the only account-creation path and
+the trusted Origin and session-bound CSRF header. Account creation/deletion
+and transaction editing/deletion endpoints are not exposed. Registration
+remains the only account-creation path and
 creates one default cash, bank, or wallet account with a zero opening balance.
+
+Every transaction create request must include a cryptographically random
+`Idempotency-Key` generated for that logical submission. The key is scoped to
+the authenticated user and transaction-creation operation. PostgreSQL stores
+the key and SHA-256 fingerprint of the normalized request on the transaction
+row, with a unique `(user_id, idempotency_key)` constraint. Because the key,
+fingerprint, and transaction share one row and one commit, a process restart or
+lost response does not lose replay state. Retrying the same key and normalized
+payload returns the original transaction; reusing the key with a different
+payload returns HTTP 409. Concurrent writes use the account row lock and the
+database unique constraint; a race loser resolves the committed row after
+rollback and never repeats balance checks or writes. The HTTP handler only attempts
+replay for PostgreSQL SQLSTATE `23505` with constraint
+`uq_transactions_user_idempotency_key`; unrelated unique, foreign-key, check, or
+other integrity violations roll back and return a generic server error rather
+than replaying an existing same-key row. Existing transaction rows
+retain null idempotency fields and remain readable. The frontend keeps the
+original key and payload after an ambiguous result, disables editing, and
+offers retry of that same operation. Its tab-scoped `sessionStorage` record
+contains only the key, owner ID, and version. After a reload the frontend calls
+the authenticated operation-resolution endpoint: a found operation is returned
+as the normal transaction DTO, while a 404 means no committed operation is
+visible yet and the same key remains in use for retries. Lookups are always
+scoped to the authenticated owner and return the same 404 for absent or other
+users' keys. The marker survives reloads and provider remounts in that tab, but
+not necessarily tab closure or a separate browser session. A confirmed transaction remains created
+even if the later list or account refresh fails; those reads have independent
+retry states.
 
 ## Account balances and transaction rules
 
@@ -165,9 +196,10 @@ the current balance would remain safe.
 Transaction creation requires an account and category owned by the authenticated
 user. The category must be active and its type must match the transaction type.
 Archived categories remain visible by name on historical transactions but are
-rejected for new transactions. Dates cannot be in the future or before the
-account opening date. Deleted transactions are omitted from history and every
-balance calculation.
+rejected for new transactions. Dates cannot be in the future relative to the
+`Asia/Kolkata` financial date or before the account opening date. The frontend
+uses the same India calendar and sends date-only values without UTC conversion.
+Deleted transactions are omitted from history and every balance calculation.
 
 Account name and asset type (`cash`, `bank`, or `wallet`) can be changed. The
 opening balance and date may be changed only before any transaction has ever
@@ -234,8 +266,8 @@ Missing or invalid sessions return 401; an authenticated request with an
 untrusted origin or missing/invalid CSRF header returns 403.
 
 CORS allows only the exact configured frontend origins, credentials, `GET`,
-`POST`, `PATCH`, and `DELETE`, and the `Content-Type` and `X-CSRF-Token`
-headers. CORS is a browser policy; the server independently checks
+`POST`, `PATCH`, and `DELETE`, and the `Content-Type`, `X-CSRF-Token`, and
+`Idempotency-Key` headers. CORS is a browser policy; the server independently checks
 Origin/Referer on registration/login and Origin plus CSRF on state-changing
 authenticated requests.
 
@@ -410,10 +442,30 @@ Before any command that connects to PostgreSQL, verify the effective database
 target. `alembic upgrade` changes that database's schema; do not point it at a
 database whose schema is not intended to be migrated.
 
-The current migration head is `6b9c2f1d4a80` (`add goal descriptions and goal-scoped ledger index`)
-and includes the approved initial schema, authentication sessions, and the goal
-description/history-index changes. Create a
-migration only after adding or changing ORM models:
+The checked-in Alembic source graph in `backend/alembic/versions/` is:
+
+```text
+4da570f34c63 -> e7a30067c81c -> 6b9c2f1d4a80 -> 8c2d6f4a1b90 -> 9d4e7a2c6b10
+```
+
+Its single current **source head** is `9d4e7a2c6b10` (`persist assistant turns
+and fenced attempt state`), whose parent is `8c2d6f4a1b90`. The graph includes
+the initial schema, authentication sessions, goal description/history-index
+changes, transaction creation idempotency fields, and assistant turn persistence.
+
+The source head does not establish the revision applied to any live database.
+No live database revision is asserted here. When separately authorized,
+`alembic current` reports the applied revision of the selected target; migration
+history and checked-in files alone do not prove that target has been upgraded.
+
+All commands below are reference instructions only. Documentation changes do
+not authorize executing them or deploying the application. Before any
+schema-changing command, verify the target and its applied revision, review the
+migration changes and backup/restore readiness, and obtain explicit approval.
+Never automatically downgrade after a failure: first establish what committed,
+then review and authorize a recovery or restoration plan.
+
+Create a migration only after adding or changing ORM models:
 
 ```sh
 alembic revision --autogenerate -m "description"
@@ -429,7 +481,7 @@ Apply migrations:
 alembic upgrade head
 ```
 
-Roll back one migration:
+Rollback reference only (requires separate review and approval; never automatic):
 
 ```sh
 alembic downgrade -1

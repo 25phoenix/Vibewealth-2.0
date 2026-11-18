@@ -1,22 +1,23 @@
 """Opt-in PostgreSQL integration checks for model-specific DDL behavior."""
 
-import os
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from http.cookies import SimpleCookie
-from threading import Barrier
+from threading import Barrier, local
 from uuid import UUID, uuid4
+
+from app.api import transaction_routes
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.core.config import get_settings
+from tests.postgres_safety import postgres_test_url
+
 from app.core.config import Settings
 from app.core.security import verify_password
 from app.core.database import engine, get_db
@@ -61,29 +62,19 @@ from app.services.goals import (
     delete_goal,
     get_goal,
 )
-from app.services.transactions import InvalidTransactionError, create_transaction
+from app.services.transactions import (
+    IdempotencyConflictError,
+    InvalidTransactionError,
+    create_transaction,
+    get_idempotent_transaction,
+)
 
 
 @pytest.fixture
 def postgres_model_session():
     """Create models in a disposable schema of a dedicated test database."""
 
-    database_url = os.getenv("POSTGRES_TEST_DATABASE_URL")
-    if not database_url:
-        pytest.skip("Set POSTGRES_TEST_DATABASE_URL to an isolated PostgreSQL test database")
-
-    test_url = make_url(database_url)
-    application_url = get_settings().sqlalchemy_url
-    if test_url.drivername != "postgresql+psycopg":
-        pytest.fail("POSTGRES_TEST_DATABASE_URL must use postgresql+psycopg")
-    if test_url.host not in {"localhost", "127.0.0.1", "::1"}:
-        pytest.fail("POSTGRES_TEST_DATABASE_URL must target the local PostgreSQL service")
-    if test_url.port != application_url.port:
-        pytest.fail("POSTGRES_TEST_DATABASE_URL must use the configured local PostgreSQL port")
-    if not test_url.database or test_url.database == application_url.database:
-        pytest.fail(
-            "POSTGRES_TEST_DATABASE_URL must name a database different from the application database"
-        )
+    test_url = postgres_test_url()
 
     engine = create_engine(test_url)
     schema = f"model_test_{uuid4().hex}"
@@ -166,6 +157,90 @@ def _authenticated_finance_headers(client, settings, session, user):
     response = client.get("/api/auth/csrf")
     assert response.status_code == 200
     return {**_origin_headers(), "X-CSRF-Token": response.json()["csrf_token"]}
+
+
+def _transaction_headers(headers, *, key=None):
+    return {**headers, "Idempotency-Key": key or uuid4().hex}
+
+
+def _concurrent_http_transaction_posts(session, user_id, requests, operation_key, *, after_second_idempotency_lookup=None):
+    """Run concurrent authenticated POSTs with independent PostgreSQL sessions."""
+
+    test_engine = session.get_bind()
+    test_settings = Settings(
+        _env_file=None,
+        # create_app requires settings to match the process-wide engine. Every
+        # request below overrides get_db with a worker session bound to the
+        # isolated test schema, so the application engine is never connected.
+        database_url=engine.url.render_as_string(hide_password=False),
+        app_environment="development",
+        allowed_frontend_origins=["http://localhost:5173"],
+        allow_insecure_cookies=True,
+        csrf_signing_secret="test-http-csrf-signing-secret-0123456789",
+    )
+    worker_factory = sessionmaker(
+        bind=test_engine,
+        class_=Session,
+        expire_on_commit=False,
+    )
+    tokens = []
+    for _ in requests:
+        token, _ = create_session(session, user_id)
+        tokens.append(token)
+    session.commit()
+    barrier = Barrier(len(requests))
+
+    def submit(index):
+        application = create_app(test_settings)
+
+        def override_db():
+            with worker_factory() as db:
+                try:
+                    yield db
+                finally:
+                    if db.in_transaction():
+                        db.rollback()
+
+        application.dependency_overrides[get_db] = override_db
+        with TestClient(
+            application,
+            base_url="http://localhost:8000",
+            raise_server_exceptions=False,
+        ) as client:
+            client.cookies.set(test_settings.auth_cookie_name, tokens[index])
+            csrf_response = client.get("/api/auth/csrf")
+            assert csrf_response.status_code == 200
+            headers = {
+                **_origin_headers(),
+                "X-CSRF-Token": csrf_response.json()["csrf_token"],
+                "Idempotency-Key": operation_key,
+            }
+            barrier.wait(timeout=10)
+            response = client.post("/api/transactions", headers=headers, json=requests[index])
+            return response.status_code, response.json()
+
+    test_thread_state = local()
+    test_engine_for_events = test_engine
+
+    def synchronize_after_lookup(connection, cursor, statement, parameters, context, executemany):
+        if after_second_idempotency_lookup is None:
+            return
+        normalized = statement.lower()
+        if 'select' not in normalized or 'idempotency_key' not in normalized or 'transactions' not in normalized:
+            return
+        count = getattr(test_thread_state, 'idempotency_lookups', 0) + 1
+        test_thread_state.idempotency_lookups = count
+        if count == 2:
+            after_second_idempotency_lookup()
+
+    if after_second_idempotency_lookup is not None:
+        event.listen(test_engine_for_events, 'after_cursor_execute', synchronize_after_lookup)
+    try:
+        with ThreadPoolExecutor(max_workers=len(requests)) as executor:
+            return list(executor.map(submit, range(len(requests))))
+    finally:
+        if after_second_idempotency_lookup is not None:
+            event.remove(test_engine_for_events, 'after_cursor_execute', synchronize_after_lookup)
 
 
 def test_postgresql_uuid_timestamp_and_account_defaults(postgres_model_session):
@@ -1569,7 +1644,7 @@ def test_http_account_and_transaction_balances_filters_and_soft_deletes(auth_htt
 
     income = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account.id),
             "category_id": str(income_category.id),
@@ -1581,7 +1656,7 @@ def test_http_account_and_transaction_balances_filters_and_soft_deletes(auth_htt
     )
     expense = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account.id),
             "category_id": str(expense_category.id),
@@ -1593,7 +1668,7 @@ def test_http_account_and_transaction_balances_filters_and_soft_deletes(auth_htt
     )
     later_expense = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account.id),
             "category_id": str(expense_category.id),
@@ -1671,6 +1746,367 @@ def test_http_account_and_transaction_balances_filters_and_soft_deletes(auth_htt
     assert client.get(f"/api/transactions/{deleted.id}").status_code == 404
 
 
+def test_http_transaction_idempotency_replays_and_conflicts_by_user(auth_http_client):
+    client, settings, session = auth_http_client
+    user_a, account_a, category_a = _make_financial_user(session)
+    account_a.opening_balance_paise = 1_000
+    session.commit()
+    unauthenticated_resolution = client.get(
+        f"/api/transactions/operations/{uuid4().hex}"
+    )
+    assert unauthenticated_resolution.status_code == 401
+    headers_a = _authenticated_finance_headers(client, settings, session, user_a)
+    key = uuid4().hex
+    payload_a = {
+        "account_id": str(account_a.id),
+        "category_id": str(category_a.id),
+        "transaction_type": "expense",
+        "amount_paise": 100,
+        "description": "Idempotent purchase",
+        "transaction_date": financial_today().isoformat(),
+    }
+
+    missing_key = client.post(
+        "/api/transactions", headers=headers_a, json=payload_a
+    )
+    assert missing_key.status_code == 422
+
+    first = client.post(
+        "/api/transactions",
+        headers=_transaction_headers(headers_a, key=key),
+        json=payload_a,
+    )
+    replay = client.post(
+        "/api/transactions",
+        headers=_transaction_headers(headers_a, key=key),
+        json=payload_a,
+    )
+    conflict = client.post(
+        "/api/transactions",
+        headers=_transaction_headers(headers_a, key=key),
+        json={**payload_a, "amount_paise": 101},
+    )
+    assert first.status_code == replay.status_code == 201
+    assert first.json() == replay.json()
+    resolved = client.get(f"/api/transactions/operations/{key}")
+    missing_operation = client.get(
+        f"/api/transactions/operations/{uuid4().hex}"
+    )
+    invalid_operation_key = client.get("/api/transactions/operations/short")
+    assert resolved.status_code == 200
+    assert resolved.json() == first.json()
+    assert resolved.headers["cache-control"] == "no-store"
+    assert missing_operation.status_code == 404
+    assert invalid_operation_key.status_code == 422
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "Idempotency-Key was already used for a different transaction"
+
+    user_b, account_b, category_b = _make_financial_user(session)
+    account_b.opening_balance_paise = 1_000
+    session.commit()
+    headers_b = _authenticated_finance_headers(client, settings, session, user_b)
+    cross_user_resolution = client.get(f"/api/transactions/operations/{key}")
+    assert cross_user_resolution.status_code == 404
+    payload_b = {
+        **payload_a,
+        "account_id": str(account_b.id),
+        "category_id": str(category_b.id),
+    }
+    user_b_create = client.post(
+        "/api/transactions",
+        headers=_transaction_headers(headers_b, key=key),
+        json=payload_b,
+    )
+    assert user_b_create.status_code == 201
+    assert user_b_create.json()["id"] != first.json()["id"]
+    user_b_resolution = client.get(f"/api/transactions/operations/{key}")
+    assert user_b_resolution.status_code == 200
+    assert user_b_resolution.json()["id"] == user_b_create.json()["id"]
+
+    next_operation = client.post(
+        "/api/transactions",
+        headers=_transaction_headers(headers_b),
+        json=payload_b,
+    )
+    assert next_operation.status_code == 201
+    assert next_operation.json()["id"] != user_b_create.json()["id"]
+
+
+def test_concurrent_identical_transaction_idempotency_creates_one_record(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, category = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    session.commit()
+    session_factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+    operation_key = uuid4().hex
+    transaction_date = financial_today()
+
+    def submit_concurrently():
+        with session_factory() as worker_session:
+            barrier.wait(timeout=10)
+            record = create_transaction(
+                worker_session,
+                user_id=user.id,
+                account_id=account.id,
+                category_id=category.id,
+                transaction_type="expense",
+                amount_paise=100,
+                description="Concurrent idempotent purchase",
+                transaction_date=transaction_date,
+                idempotency_key=operation_key,
+            )
+            worker_session.commit()
+            return record.transaction.id
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: submit_concurrently(), range(2)))
+
+    session.expire_all()
+    count = session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user.id,
+            Transaction.idempotency_key == operation_key,
+        )
+    )
+    assert results[0] == results[1]
+    assert count == 1
+    assert get_idempotent_transaction(
+        session, user_id=user.id, idempotency_key=operation_key
+    ).transaction.id == results[0]
+
+
+def test_concurrent_conflicting_transaction_payloads_return_one_conflict(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, category = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    session.commit()
+    session_factory = sessionmaker(
+        bind=session.get_bind(), class_=Session, expire_on_commit=False
+    )
+    barrier = Barrier(2)
+    operation_key = uuid4().hex
+
+    def submit(amount_paise):
+        with session_factory() as worker_session:
+            barrier.wait(timeout=10)
+            try:
+                record = create_transaction(
+                    worker_session,
+                    user_id=user.id,
+                    account_id=account.id,
+                    category_id=category.id,
+                    transaction_type="expense",
+                    amount_paise=amount_paise,
+                    description="Concurrent conflicting request",
+                    transaction_date=financial_today(),
+                    idempotency_key=operation_key,
+                )
+                worker_session.commit()
+                return ("created", record.transaction.id)
+            except IdempotencyConflictError:
+                worker_session.rollback()
+                return ("conflict", None)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(submit, [100, 101]))
+
+    assert sorted(result[0] for result in results) == ["conflict", "created"]
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user.id,
+            Transaction.idempotency_key == operation_key,
+        )
+    ) == 1
+
+
+def test_concurrent_http_idempotency_across_accounts_resolves_unique_constraint_races(
+    auth_http_client, monkeypatch,
+):
+    client, settings, session = auth_http_client
+    user, account_a, category = _make_financial_user(session)
+    account_a.opening_balance_paise = 1_000
+    account_b = Account(
+        user_id=user.id,
+        name="Secondary",
+        account_type="wallet",
+        is_default=False,
+        opening_balance_paise=1_000,
+        opening_balance_as_of=date(2026, 1, 1),
+    )
+    session.add(account_b)
+    session.commit()
+
+    matching_key = uuid4().hex
+    matching_payload = {
+        "account_id": str(account_a.id),
+        "category_id": str(category.id),
+        "transaction_type": "expense",
+        "amount_paise": 100,
+        "description": "Concurrent identical HTTP operation",
+        "transaction_date": financial_today().isoformat(),
+    }
+    matching_results = _concurrent_http_transaction_posts(
+        session,
+        user.id,
+        [matching_payload, matching_payload],
+        matching_key,
+    )
+    assert [result[0] for result in matching_results] == [201, 201]
+    assert matching_results[0][1] == matching_results[1][1]
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user.id,
+            Transaction.idempotency_key == matching_key,
+        )
+    ) == 1
+
+    conflicting_key = uuid4().hex
+    payload_a = {
+        **matching_payload,
+        "description": "Concurrent different-account request",
+    }
+    payload_b = {
+        **payload_a,
+        "account_id": str(account_b.id),
+        "amount_paise": 125,
+    }
+    race_barrier = Barrier(2)
+    lookup_arrivals = []
+    recovered_constraints = []
+    recovery_calls = []
+    original_recovery = transaction_routes._recover_idempotency_integrity_error
+    original_predicate = transaction_routes._is_idempotency_unique_violation
+
+    def observe_predicate(error):
+        matched = original_predicate(error)
+        recovered_constraints.append((getattr(getattr(getattr(error, 'orig', None), 'diag', None), 'constraint_name', None), matched))
+        return matched
+
+    def observe_recovery(*args, **kwargs):
+        recovery_calls.append(True)
+        return original_recovery(*args, **kwargs)
+
+    def synchronize_requests():
+        lookup_arrivals.append(True)
+        race_barrier.wait(timeout=10)
+
+    monkeypatch.setattr(transaction_routes, '_is_idempotency_unique_violation', observe_predicate)
+    monkeypatch.setattr(transaction_routes, '_recover_idempotency_integrity_error', observe_recovery)
+    conflicting_results = _concurrent_http_transaction_posts(
+        session,
+        user.id,
+        [payload_a, payload_b],
+        conflicting_key,
+        after_second_idempotency_lookup=synchronize_requests,
+    )
+    assert len(lookup_arrivals) == 2
+    assert recovered_constraints == [('uq_transactions_user_idempotency_key', True)]
+    assert len(recovery_calls) == 1
+    statuses = sorted(result[0] for result in conflicting_results)
+    assert statuses == [201, 409]
+    assert all(result[0] != 500 for result in conflicting_results)
+    conflict_body = next(body for code, body in conflicting_results if code == 409)
+    assert conflict_body["detail"] == "Idempotency-Key was already used for a different transaction"
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.user_id == user.id,
+            Transaction.idempotency_key == conflicting_key,
+        )
+    ) == 1
+    balances_response = client.get('/api/accounts', headers=_authenticated_finance_headers(client, settings, session, user))
+    assert balances_response.status_code == 200
+    balances = {item['id']: item['balance_paise'] for item in balances_response.json()}
+    assert sum(balances.values()) in {1_775, 1_800}
+    assert (balances[str(account_a.id)] == 800 and balances[str(account_b.id)] == 1_000) or (
+        balances[str(account_a.id)] == 900 and balances[str(account_b.id)] == 875
+    )
+
+
+def test_unrelated_integrity_error_does_not_replay_existing_same_key_transaction(
+    auth_http_client, monkeypatch,
+):
+    client, settings, session = auth_http_client
+    user, account, category = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+    key = uuid4().hex
+    payload = {
+        'account_id': str(account.id),
+        'category_id': str(category.id),
+        'transaction_type': 'expense',
+        'amount_paise': 100,
+        'description': 'Existing same-key operation',
+        'transaction_date': financial_today().isoformat(),
+    }
+    created = client.post('/api/transactions', headers=_transaction_headers(headers, key=key), json=payload)
+    assert created.status_code == 201
+
+    class OtherConstraintDiagnostic:
+        constraint_name = 'uq_transactions_some_other_constraint'
+
+    class OtherUniqueViolation(Exception):
+        sqlstate = '23505'
+        diag = OtherConstraintDiagnostic()
+
+    monkeypatch.setattr(
+        transaction_routes,
+        'create_transaction',
+        lambda *args, **kwargs: (_ for _ in ()).throw(IntegrityError('insert', {}, OtherUniqueViolation())),
+    )
+    recovery_calls = []
+    original_recovery = transaction_routes._recover_idempotency_integrity_error
+    monkeypatch.setattr(
+        transaction_routes,
+        '_recover_idempotency_integrity_error',
+        lambda *args, **kwargs: (recovery_calls.append(True), original_recovery(*args, **kwargs))[1],
+    )
+    rejected = client.post('/api/transactions', headers=_transaction_headers(headers, key=key), json=payload)
+    assert rejected.status_code == 500
+    assert recovery_calls == []
+    assert session.scalar(select(func.count()).select_from(Transaction).where(
+        Transaction.user_id == user.id, Transaction.idempotency_key == key
+    )) == 1
+
+
+def test_idempotency_transaction_and_fingerprint_roll_back_atomically(
+    postgres_model_session,
+):
+    session = postgres_model_session
+    user, account, category = _make_financial_user(session)
+    account.opening_balance_paise = 1_000
+    operation_key = uuid4().hex
+    record = create_transaction(
+        session,
+        user_id=user.id,
+        account_id=account.id,
+        category_id=category.id,
+        transaction_type="expense",
+        amount_paise=100,
+        description="Rolled back transaction",
+        transaction_date=financial_today(),
+        idempotency_key=operation_key,
+    )
+    assert record.transaction.idempotency_key == operation_key
+    assert record.transaction.request_fingerprint is not None
+    session.rollback()
+    assert get_idempotent_transaction(
+        session, user_id=user.id, idempotency_key=operation_key
+    ) is None
+    assert session.scalar(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.idempotency_key == operation_key
+        )
+    ) == 0
+
+
 def test_http_financial_routes_reject_cross_user_ids_and_categories(auth_http_client):
     client, settings, session = auth_http_client
     user_a, account_a, expense_a = _make_financial_user(session)
@@ -1697,7 +2133,7 @@ def test_http_financial_routes_reject_cross_user_ids_and_categories(auth_http_cl
 
     foreign_account = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account_b.id),
             "category_id": str(expense_a.id),
@@ -1709,7 +2145,7 @@ def test_http_financial_routes_reject_cross_user_ids_and_categories(auth_http_cl
     )
     foreign_category = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account_a.id),
             "category_id": str(expense_b.id),
@@ -1774,7 +2210,7 @@ def test_historical_daily_balances_stay_within_javascript_safe_integer(auth_http
     def post(category_id, transaction_type, amount_paise, transaction_date):
         return client.post(
             "/api/transactions",
-            headers=headers,
+            headers=_transaction_headers(headers),
             json={
                 "account_id": str(account.id),
                 "category_id": str(category_id),
@@ -1861,7 +2297,7 @@ def test_soft_deleted_transactions_do_not_affect_safe_balance_validation(
 
     active_transaction = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account.id),
             "category_id": str(income_category.id),
@@ -1917,7 +2353,7 @@ def test_http_transaction_creation_rejects_invalid_category_and_dates(
 
     response = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account.id),
             "category_id": str(category_id),
@@ -1955,7 +2391,7 @@ def test_account_opening_balance_locks_after_even_a_soft_deleted_transaction(aut
 
     created = client.post(
         "/api/transactions",
-        headers=headers,
+        headers=_transaction_headers(headers),
         json={
             "account_id": str(account.id),
             "category_id": str(expense_category.id),
@@ -2293,7 +2729,7 @@ def test_budget_aggregate_precision_contract_for_list_retrieve_and_openapi(
     for account in (account_a, account_b):
         transaction = client.post(
             "/api/transactions",
-            headers=headers,
+            headers=_transaction_headers(headers),
             json={
                 "account_id": str(account.id),
                 "category_id": str(expense_category.id),
@@ -2460,7 +2896,7 @@ def test_expenses_never_reduce_available_to_spend_below_zero(auth_http_client):
     def post_transaction(account_id, category_id, transaction_type, amount):
         return client.post(
             "/api/transactions",
-            headers=headers,
+            headers=_transaction_headers(headers),
             json={
                 "account_id": str(account_id),
                 "category_id": str(category_id),
@@ -2601,7 +3037,7 @@ def test_http_goal_crud_contributions_withdrawals_and_account_availability(auth_
 
     income = client.post(
         "/api/transactions",
-        headers=headers_a,
+        headers=_transaction_headers(headers_a),
         json={
             "account_id": str(account_a.id),
             "category_id": str(income_category.id),
@@ -2777,7 +3213,7 @@ def test_http_goal_crud_contributions_withdrawals_and_account_availability(auth_
 
     expense = client.post(
         "/api/transactions",
-        headers=headers_a,
+        headers=_transaction_headers(headers_a),
         json={
             "account_id": str(account_a.id),
             "category_id": str(food.id),
@@ -3445,3 +3881,407 @@ def test_concurrent_opening_balance_update_and_contribution_serialize(
     assert snapshot.balance_paise in {100, 200}
     assert snapshot.goal_allocated_paise == 50
     assert snapshot.available_to_spend_paise >= 0
+
+
+def test_dashboard_summary_is_tenant_scoped_and_preserves_financial_rules(postgres_model_session):
+    from app.services.dashboard import get_dashboard_summary
+
+    session = postgres_model_session
+    today = financial_today()
+    month_start = today.replace(day=1)
+    previous_day = month_start - timedelta(days=1)
+    user_a, account_a, expense_category = _make_financial_user(session)
+    user_b, account_b, category_b = _make_financial_user(session)
+    account_a.opening_balance_paise = 100_000
+    account_a.opening_balance_as_of = month_start
+    high_balance_account = Account(
+        user_id=user_a.id,
+        name="Large reserve",
+        account_type="bank",
+        is_default=False,
+        opening_balance_paise=MAX_SAFE_PAISE,
+        opening_balance_as_of=today,
+    )
+    income_category = Category(
+        user_id=user_a.id, name="Salary", transaction_type="income"
+    )
+    session.add_all([high_balance_account, income_category])
+    session.flush()
+
+    current_timestamp = datetime.now(timezone.utc)
+    session.add_all([
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=income_category.id,
+            transaction_type="income",
+            amount_paise=60_000,
+            description="Before account opened",
+            transaction_date=previous_day,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=income_category.id,
+            transaction_type="income",
+            amount_paise=1_000,
+            description="Monthly income",
+            transaction_date=today,
+            created_at=current_timestamp,
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=expense_category.id,
+            transaction_type="expense",
+            amount_paise=10_000,
+            description="Current expense",
+            transaction_date=today,
+            created_at=current_timestamp + timedelta(seconds=1),
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=None,
+            transaction_type="expense",
+            amount_paise=2_000,
+            description="Uncategorized expense",
+            transaction_date=today,
+            created_at=current_timestamp + timedelta(seconds=2),
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=expense_category.id,
+            transaction_type="expense",
+            amount_paise=300,
+            description="Latest expense",
+            transaction_date=today,
+            created_at=current_timestamp + timedelta(seconds=3),
+        ),
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=expense_category.id,
+            transaction_type="expense",
+            amount_paise=999_999,
+            description="Deleted expense",
+            transaction_date=today,
+            created_at=current_timestamp + timedelta(seconds=4),
+            deleted_at=current_timestamp + timedelta(seconds=5),
+        ),
+        Transaction(
+            user_id=user_b.id,
+            account_id=account_b.id,
+            category_id=category_b.id,
+            transaction_type="expense",
+            amount_paise=123_456,
+            description="Other user's expense",
+            transaction_date=today,
+            created_at=current_timestamp + timedelta(seconds=4),
+        ),
+    ])
+    goal = _make_goal(session, user_a, name="Emergency fund", target_paise=4_000)
+    second_goal = _make_goal(session, user_a, name="Travel fund", target_paise=10_000)
+    deleted_goal = _make_goal(session, user_a, name="Completed goal", target_paise=3_000)
+    # PostgreSQL now() is constant within a transaction; control ordering
+    # explicitly rather than letting random UUIDs break timestamp ties.
+    goal.created_at = current_timestamp - timedelta(days=2)
+    second_goal.created_at = current_timestamp - timedelta(days=1)
+    deleted_goal.deleted_at = current_timestamp
+    session.add(GoalEntry(
+        user_id=user_a.id,
+        goal_id=goal.id,
+        account_id=account_a.id,
+        entry_type="contribution",
+        amount_paise=5_000,
+        effective_date=today,
+    ))
+    session.add_all([
+        GoalEntry(
+            user_id=user_a.id,
+            goal_id=second_goal.id,
+            account_id=high_balance_account.id,
+            entry_type="contribution",
+            amount_paise=2_000,
+            effective_date=today,
+        ),
+        GoalEntry(
+            user_id=user_a.id,
+            goal_id=deleted_goal.id,
+            account_id=account_a.id,
+            entry_type="contribution",
+            amount_paise=1_000,
+            effective_date=today,
+        ),
+        GoalEntry(
+            user_id=user_a.id,
+            goal_id=deleted_goal.id,
+            account_id=account_a.id,
+            entry_type="withdrawal",
+            amount_paise=1_000,
+            effective_date=today,
+        ),
+    ])
+    session.add_all([
+        Budget(
+            user_id=user_a.id,
+            category_id=None,
+            month_start=month_start,
+            limit_paise=8_000,
+        ),
+        Budget(
+            user_id=user_a.id,
+            category_id=expense_category.id,
+            month_start=month_start,
+            limit_paise=15_000,
+        ),
+    ])
+    session.commit()
+
+    result = get_dashboard_summary(session, user_id=user_a.id)
+
+    assert result["financial_date"] == today
+    assert result["month_start"] == month_start
+    assert result["month_end_exclusive"] == dashboard_month_end(today)
+    assert result["account_totals"] == {
+        "account_count": 2,
+        "balance_paise": str(MAX_SAFE_PAISE + 88_700),
+        "goal_allocated_paise": "7000",
+        "available_to_spend_paise": str(MAX_SAFE_PAISE + 81_700),
+    }
+    assert result["cash_flow"] == {
+        "income_paise": "1000",
+        "expenses_paise": "12300",
+        "net_paise": "-11300",
+    }
+    assert [(item["category_id"], item["actual_spending_paise"], item["remaining_paise"], item["percent_used_basis_points"]) for item in result["budgets"]] == [
+        (None, "12300", "-4300", "15375"),
+        (str(expense_category.id), "10300", "4700", "6867"),
+    ]
+    assert result["goals_total"] == 2
+    assert [(item["name"], item["allocated_paise"], item["remaining_target_paise"]) for item in result["goals"]] == [
+        ("Travel fund", 2_000, 8_000),
+        ("Emergency fund", 5_000, -1_000),
+    ]
+    assert [item["description"] for item in result["recent_transactions"]["items"]] == [
+        "Latest expense",
+        "Uncategorized expense",
+        "Current expense",
+        "Monthly income",
+    ]
+    assert result["recent_transactions"]["total"] == 5
+    assert result["recent_transactions"]["limit"] == 4
+
+
+def dashboard_month_end(day):
+    if day.month == 12:
+        return date(day.year + 1, 1, 1)
+    return date(day.year, day.month + 1, 1)
+
+
+def test_dashboard_budget_spending_matches_budget_service_for_persisted_out_of_range_dates(
+    postgres_model_session, monkeypatch,
+):
+    from app.services import dashboard
+    from app.services.budgets import list_budgets
+
+    # These legacy/import-shaped records bypass create_transaction, which
+    # rejects both pre-opening and future dates in supported application flows.
+    today = date(2026, 11, 14)
+    month_start = today.replace(day=1)
+    monkeypatch.setattr(dashboard, "financial_today", lambda: today)
+    session = postgres_model_session
+    user, account, category = _make_financial_user(session)
+    account.opening_balance_paise = 10_000
+    account.opening_balance_as_of = today
+    for transaction_date, amount, description, deleted_at in [
+        (today - timedelta(days=1), 1_100, "Before opening", None),
+        (today + timedelta(days=1), 2_200, "After today", None),
+        (today, 3_300, "Current expense", None),
+        (month_start - timedelta(days=1), 4_400, "Previous month", None),
+        (date(2026, 12, 1), 5_500, "Next month", None),
+        (today, 6_600, "Deleted expense", datetime(2026, 11, 14, tzinfo=timezone.utc)),
+    ]:
+        session.add(Transaction(
+            user_id=user.id,
+            account_id=account.id,
+            category_id=category.id,
+            transaction_type="expense",
+            amount_paise=amount,
+            description=description,
+            transaction_date=transaction_date,
+            deleted_at=deleted_at,
+        ))
+    session.add_all([
+        Budget(user_id=user.id, category_id=None, month_start=month_start, limit_paise=10_000),
+        Budget(user_id=user.id, category_id=category.id, month_start=month_start, limit_paise=20_000),
+    ])
+    session.commit()
+
+    summary = dashboard.get_dashboard_summary(session, user_id=user.id)
+    expected = [
+        (None, "6600", "3400", "6600"),
+        (str(category.id), "6600", "13400", "3300"),
+    ]
+    assert [
+        (item["category_id"], item["actual_spending_paise"], item["remaining_paise"], item["percent_used_basis_points"])
+        for item in summary["budgets"]
+    ] == expected
+    budgets = list_budgets(session, user_id=user.id, month_start=month_start)
+    assert [
+        (str(item.budget.category_id) if item.budget.category_id else None,
+         str(item.actual_spending_paise), str(item.remaining_paise), str(item.percent_used_basis_points))
+        for item in budgets
+    ] == expected
+    # Budget inclusion does not change actual balance or cash-flow date rules.
+    assert summary["account_totals"]["balance_paise"] == "6700"
+    assert summary["cash_flow"] == {
+        "income_paise": "0", "expenses_paise": "3300", "net_paise": "-3300",
+    }
+
+
+def test_dashboard_summary_http_is_authenticated_and_uses_session_owner(auth_http_client):
+    client, settings, session = auth_http_client
+    today = financial_today()
+    month_start = today.replace(day=1)
+    user_a, account_a, category_a = _make_financial_user(session)
+    user_b, account_b, category_b = _make_financial_user(session)
+    account_a.opening_balance_paise = 10_000
+    session.add_all([
+        Transaction(
+            user_id=user_a.id,
+            account_id=account_a.id,
+            category_id=category_a.id,
+            transaction_type="expense",
+            amount_paise=2300,
+            description="Own HTTP expense",
+            transaction_date=today,
+        ),
+        Transaction(
+            user_id=user_b.id,
+            account_id=account_b.id,
+            category_id=category_b.id,
+            transaction_type="expense",
+            amount_paise=9100,
+            description="Private other-user expense",
+            transaction_date=today,
+        ),
+        Budget(
+            user_id=user_a.id,
+            category_id=None,
+            month_start=month_start,
+            limit_paise=5000,
+        ),
+        Budget(
+            user_id=user_b.id,
+            category_id=None,
+            month_start=month_start,
+            limit_paise=10000,
+        ),
+    ])
+    own_goal = _make_goal(session, user_a, name="Own HTTP goal", target_paise=8000)
+    other_goal = _make_goal(session, user_b, name="Private other-user goal", target_paise=9000)
+    session.add_all([
+        GoalEntry(
+            user_id=user_a.id,
+            goal_id=own_goal.id,
+            account_id=account_a.id,
+            entry_type="contribution",
+            amount_paise=1200,
+            effective_date=today,
+        ),
+        GoalEntry(
+            user_id=user_b.id,
+            goal_id=other_goal.id,
+            account_id=account_b.id,
+            entry_type="contribution",
+            amount_paise=3400,
+            effective_date=today,
+        ),
+    ])
+    session.commit()
+
+    assert client.get("/api/dashboard/summary").status_code == 401
+    headers = _authenticated_finance_headers(client, settings, session, user_a)
+    response = client.get(
+        f"/api/dashboard/summary?user_id={user_b.id}", headers=headers
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["account_totals"] == {
+        "account_count": 1,
+        "balance_paise": "7700",
+        "goal_allocated_paise": "1200",
+        "available_to_spend_paise": "6500",
+    }
+    assert isinstance(payload["account_totals"]["balance_paise"], str)
+    assert payload["cash_flow"] == {
+        "income_paise": "0",
+        "expenses_paise": "2300",
+        "net_paise": "-2300",
+    }
+    assert len(payload["budgets"]) == 1
+    assert payload["budgets"][0]["limit_paise"] == 5000
+    assert isinstance(payload["budgets"][0]["limit_paise"], int)
+    assert payload["budgets"][0]["actual_spending_paise"] == "2300"
+    assert [goal["name"] for goal in payload["goals"]] == ["Own HTTP goal"]
+    assert isinstance(payload["goals"][0]["target_paise"], int)
+    assert [item["description"] for item in payload["recent_transactions"]["items"]] == [
+        "Own HTTP expense"
+    ]
+    assert isinstance(payload["recent_transactions"]["items"][0]["amount_paise"], int)
+    assert "Private other-user expense" not in response.text
+    assert "Private other-user goal" not in response.text
+    assert payload["recent_transactions"] == {
+        "items": payload["recent_transactions"]["items"],
+        "total": 1,
+        "offset": 0,
+        "limit": 4,
+    }
+    assert payload["financial_date"] == financial_today().isoformat()
+    assert payload["month_start"] == financial_today().replace(day=1).isoformat()
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_dashboard_summary_http_hides_database_errors(auth_http_client, monkeypatch):
+    from app.api import dashboard_routes
+
+    client, settings, session = auth_http_client
+    user, _, _ = _make_financial_user(session)
+    session.commit()
+    headers = _authenticated_finance_headers(client, settings, session, user)
+
+    def fail_summary(*args, **kwargs):
+        raise SQLAlchemyError("private database host and credential details")
+
+    monkeypatch.setattr(dashboard_routes, "get_dashboard_summary", fail_summary)
+    response = client.get("/api/dashboard/summary", headers=headers)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Dashboard summary could not be loaded"}
+    assert "private database" not in response.text
+    assert "credential" not in response.text
+
+
+def test_dashboard_summary_aggregates_remain_exact_beyond_bigint(postgres_model_session):
+    from app.services.dashboard import get_dashboard_summary
+
+    session = postgres_model_session
+    today = financial_today()
+    user, account, _ = _make_financial_user(session)
+    maximum_bigint = 9_223_372_036_854_775_807
+    account.opening_balance_paise = maximum_bigint
+    account.opening_balance_as_of = today
+    second_account = _add_account(
+        session, user, name="Large reserve", opening_paise=maximum_bigint
+    )
+    session.commit()
+
+    summary = get_dashboard_summary(session, user_id=user.id)
+
+    assert summary["account_totals"]["account_count"] == 2
+    assert summary["account_totals"]["balance_paise"] == "18446744073709551614"
+    assert summary["account_totals"]["goal_allocated_paise"] == "0"
+    assert summary["account_totals"]["available_to_spend_paise"] == "18446744073709551614"

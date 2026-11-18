@@ -382,26 +382,12 @@ def _require_active_goal(db: Session, *, user_id: UUID, goal_id: UUID) -> Saving
 
 
 def _allocations_by_goal_and_account(
-    db: Session, *, user_id: UUID, goal_ids: list[UUID]
+    db: Session, *, user_id: UUID, goal_ids: list[UUID], as_of: date | None = None
 ) -> dict[UUID, dict[UUID, int]]:
     if not goal_ids:
         return {}
-    net_amount = func.sum(
-        case(
-            (GoalEntry.entry_type == "contribution", GoalEntry.amount_paise),
-            else_=-GoalEntry.amount_paise,
-        )
-    )
-    rows = db.execute(
-        select(GoalEntry.goal_id, GoalEntry.account_id, net_amount)
-        .where(
-            GoalEntry.user_id == user_id,
-            GoalEntry.goal_id.in_(goal_ids),
-            GoalEntry.effective_date <= financial_today(),
-        )
-        .group_by(GoalEntry.goal_id, GoalEntry.account_id)
-        .order_by(GoalEntry.goal_id, GoalEntry.account_id)
-    ).all()
+    rows = db.execute(allocation_statement(user_id=user_id, as_of=as_of or financial_today())
+        .where(GoalEntry.goal_id.in_(goal_ids)).order_by(GoalEntry.goal_id, GoalEntry.account_id)).all()
     result: dict[UUID, dict[UUID, int]] = {}
     for goal_id, account_id, amount in rows:
         value = int(amount)
@@ -465,3 +451,12 @@ def _normalize_description(value: object) -> str | None:
 def _validate_pagination(*, offset: int, limit: int) -> None:
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
         raise InvalidGoalError("Pagination must use offset >= 0 and limit from 1 to 100")
+
+
+def allocation_statement(*, user_id: UUID, as_of: date):
+    """Authoritative ledger nets shared by API reads and bounded reporting."""
+    net = func.sum(case((GoalEntry.entry_type == "contribution", GoalEntry.amount_paise),
+                        else_=-GoalEntry.amount_paise)).label("allocated_paise")
+    return select(GoalEntry.goal_id, GoalEntry.account_id, net).where(
+        GoalEntry.user_id == user_id, GoalEntry.effective_date <= as_of
+    ).group_by(GoalEntry.goal_id, GoalEntry.account_id)

@@ -8,6 +8,7 @@ from app.models import (
     AuthSession,
     AssistantConversation,
     AssistantMessage,
+    AssistantTurn,
     Base,
     Budget,
     Category,
@@ -29,6 +30,7 @@ EXPECTED_TABLES = {
     "goal_entries",
     "assistant_conversations",
     "assistant_messages",
+    "assistant_turns",
 }
 
 
@@ -59,6 +61,7 @@ def test_all_approved_tables_are_registered_on_shared_metadata() -> None:
             GoalEntry,
             AssistantConversation,
             AssistantMessage,
+            AssistantTurn,
         )
     )
 
@@ -75,6 +78,7 @@ def test_models_have_python_uuid_and_server_timestamp_defaults() -> None:
         GoalEntry,
         AssistantConversation,
         AssistantMessage,
+        AssistantTurn,
     ):
         assert callable(model.__table__.c.id.default.arg)
         assert model.__table__.c.id.default.arg.__name__ == "uuid4"
